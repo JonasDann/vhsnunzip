@@ -12,7 +12,7 @@ use work.vhsnunzip_int_pkg.all;
 
 entity vhsnunzip_unbuffered_tc is
   generic (
-    RAM_STYLE       : string := "URAM"
+    RAM_STYLE       : string := "ultra"
   );
 end vhsnunzip_unbuffered_tc;
 

@@ -13,15 +13,15 @@ use unisim.vcomponents.all;
 library unimacro;
 use unimacro.vcomponents.all;
 
--- Primitive instantiation of a Xilinx URAM or collection of 8 BRAMs. 4k deep,
+-- Primitive instantiation of a Xilinx ultra or collection of 8 BRAMs. 4k deep,
 -- 8+1 bytes wide, for 32+4kiB of storage, with two R/W access ports. The total
 -- read latency is exactly 3 cycles.
 entity vhsnunzip_ram is
   generic (
 
-    -- Select "URAM" to instantiate an UltraRAM block, or "BRAM" to use eight
+    -- Select "ultra" to instantiate an UltraRAM block, or "block" to use eight
     -- 36kib block RAMs.
-    RAM_STYLE   : string := "URAM"
+    RAM_STYLE   : string := "ultra"
 
   );
   port (
@@ -42,8 +42,8 @@ end vhsnunzip_ram;
 architecture behavior of vhsnunzip_ram is
 begin
 
-  -- Implementation for URAMs.
-  uram_gen: if RAM_STYLE = "URAM" generate
+  -- Implementation for ultra RAMs.
+  uram_gen: if RAM_STYLE = "ultra" generate
     signal a_addr     : std_logic_vector(22 downto 0);
     signal a_wdat     : std_logic_vector(71 downto 0);
     signal a_rval_r   : std_logic;
@@ -162,7 +162,7 @@ begin
 
   end generate;
 
-  bram_gen: if RAM_STYLE = "BRAM" generate
+  bram_gen: if RAM_STYLE = "block" generate
     type data_array is array (natural range <>) of std_logic_vector(8 downto 0);
 
     signal a_ena      : std_logic;

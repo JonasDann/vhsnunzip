@@ -106,12 +106,12 @@ architecture behavior of vhsnunzip is
     loop
       if urams * b2u_m / b2u_d > brams then
         if remain = 0 then
-          return "BRAM";
+          return "block";
         end if;
         brams := brams + 16;
       else
         if remain = 0 then
-          return "URAM";
+          return "ultra";
         end if;
         urams := urams + 2;
       end if;

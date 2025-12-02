@@ -515,13 +515,13 @@ package vhsnunzip_int_pkg is
 
   type ram_response_array is array (natural range <>) of ram_response;
 
-  -- Unit representing a single Xilinx URAM or collection of 8 BRAMs. There are
+  -- Unit representing a single Xilinx ultra or collection of 8 BRAMs. There are
   -- two files for this entity; one is a behavioral model intended for
   -- vendor-agnostic simulation, the other contains the Xilinx primitives (and
   -- their simulation models) to instantiate the memories.
   component vhsnunzip_ram is
     generic (
-      RAM_STYLE   : string := "URAM"
+      RAM_STYLE   : string := "ultra"
     );
     port (
       clk         : in  std_logic;
@@ -635,7 +635,7 @@ package vhsnunzip_int_pkg is
   -- decompression time may be longer due to memory bandwidth starvation.
   component vhsnunzip_buffered is
     generic (
-      RAM_STYLE   : string := "URAM"
+      RAM_STYLE   : string := "ultra"
     );
     port (
       clk         : in  std_logic;

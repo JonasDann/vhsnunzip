@@ -17,8 +17,8 @@ entity vhsnunzip_buffered is
   generic (
 
     -- This block can use either 2 UltraRAMs or 16 Xilinx 36k block RAMs.
-    -- Select "URAM" for UltraRAMs or "BRAM" for block RAMs.
-    RAM_STYLE   : string := "URAM"
+    -- Select "ultra" for UltraRAMs or "block" for block RAMs.
+    RAM_STYLE   : string := "ultra"
 
   );
   port (
@@ -278,7 +278,7 @@ begin
   -- full. This leaves room for 8 pipeline stages in the read path.
   of_block <= of_level(4) and of_level(3) and not of_level(5);
 
-  -- This block contains 64kiB of large-scale memory, either URAM or
+  -- This block contains 64kiB of large-scale memory, either ultra RAM or
   -- BRAM-based, that's used for three things:
   --
   --  - Long-term decompression history: Snappy compression works by copying

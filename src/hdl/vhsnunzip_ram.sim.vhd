@@ -5,7 +5,7 @@ use ieee.numeric_std.all;
 library work;
 use work.vhsnunzip_int_pkg.all;
 
--- Behavioral description of a Xilinx URAM or collection of 8 BRAMs. 4k deep,
+-- Behavioral description of a Xilinx ultra or collection of 8 BRAMs. 4k deep,
 -- 8+1 bytes wide, for 32+4kiB of storage, with two R/W access ports. The total
 -- read latency is exactly 3 cycles.
 --
@@ -17,7 +17,7 @@ entity vhsnunzip_ram is
 
     -- RAM style generic for compatibility with the synthesis version of this
     -- file. Unused here.
-    RAM_STYLE   : string := "URAM"
+    RAM_STYLE   : string := "ultra"
 
   );
   port (

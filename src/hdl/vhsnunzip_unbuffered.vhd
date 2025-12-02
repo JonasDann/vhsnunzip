@@ -19,8 +19,8 @@ entity vhsnunzip_unbuffered is
     LONG_CHUNKS : boolean := true;
 
     -- This block can use either 2 UltraRAMs or 16 Xilinx 36k block RAMs.
-    -- Select "URAM" for UltraRAMs or "BRAM" for block RAMs.
-    RAM_STYLE   : string := "URAM"
+    -- Select "ultra" for UltraRAMs or "block" for block RAMs.
+    RAM_STYLE   : string := "ultra"
 
   );
   port (

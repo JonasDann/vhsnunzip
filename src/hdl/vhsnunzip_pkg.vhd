@@ -10,7 +10,7 @@ package vhsnunzip_pkg is
   component vhsnunzip_unbuffered is
     generic (
       LONG_CHUNKS : boolean := true;
-      RAM_STYLE   : string := "URAM"
+      RAM_STYLE   : string := "ultra"
     );
     port (
       clk         : in  std_logic;
