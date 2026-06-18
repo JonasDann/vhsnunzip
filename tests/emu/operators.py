@@ -311,8 +311,9 @@ def cmd_gen_2(partial_commands):
         li_chunk_len = min(li_len + 1, WI*2 - li_off, budget)
 
         # Hardware optimization at the cost of a tiny amount of throughput;
-        # can be disabled.
-        if li_off >= 8:
+        # can be disabled. (Matches the datapath's li_off(C_IDX) check: the
+        # literal data starts in the lookahead line.)
+        if li_off >= WI:
             li_chunk_len = 0
 
         li_rol = (li_off - off) & (WI*2-1)

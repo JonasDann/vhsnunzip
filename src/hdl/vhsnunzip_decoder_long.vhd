@@ -3,6 +3,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.vhsnunzip_utils_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
 -- Snappy element decoder with support for chunks > 64kiB.
@@ -37,12 +38,12 @@ begin
 
     -- Next offset, in case the data we're decoding actually consists of
     -- element headers and not literal data.
-    variable offns  : unsigned(3 downto 0) := (others => '0');
+    variable offns  : unsigned(C_WIN-1 downto 0) := (others => '0');
     variable offn   : unsigned(8 downto 0) := (others => '0');
     variable offnh  : unsigned(23 downto 0) := (others => '0');
 
     -- Same as `off`, but modulo the line width and converted to integer.
-    variable ofi    : natural range 0 to 7 := 0;
+    variable ofi    : natural range 0 to C_BYTES-1 := 0;
 
     -- Output holding register.
     variable elh    : element_stream := ELEMENT_STREAM_INIT;
@@ -75,8 +76,8 @@ begin
         ---------------------------------------------------------------------
         -- Handle copy elements
         ---------------------------------------------------------------------
-        offns := resize(off(2 downto 0), 4);
-        ofi := to_integer(off(2 downto 0));
+        offns := resize(off(C_IDX-1 downto 0), C_WIN);
+        ofi := to_integer(off(C_IDX-1 downto 0));
 
         case cdh.data(ofi)(1 downto 0) is
 
@@ -118,7 +119,7 @@ begin
         ---------------------------------------------------------------------
         -- Handle literal elements
         ---------------------------------------------------------------------
-        ofi := to_integer(offns(2 downto 0));
+        ofi := to_integer(offns(C_IDX-1 downto 0));
 
         if offns > cdh.endi then
           -- No element (for now); beyond end of stream or starts on the next
@@ -204,7 +205,7 @@ begin
         -- indicate to the datapath that it should pop from the literal line
         -- stream after executing this command to stay in sync.
         if off > cdh.endi or offh /= 0 then
-          off := off - 8;
+          off := off - C_BYTES;
           cdh.valid := '0';
           elh.ld_pop := '1';
           elh.last := cdh.last;

@@ -3,6 +3,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.vhsnunzip_utils_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
 -- Decompression datapath command generator stage 1.
@@ -66,10 +67,10 @@ begin
 
         -- Determine how many bytes we can write for the copy element. If there
         -- is no copy element, this becomes 0 automatically.
-        if cp_rem < 8 then
-          c1h.cp_len := cp_rem(3 downto 0);
+        if cp_rem < C_BYTES then
+          c1h.cp_len := cp_rem(C_CNT-1 downto 0);
         else
-          c1h.cp_len := "0111";
+          c1h.cp_len := to_signed(C_BYTES-1, C_CNT);
         end if;
 
         if elh.cp_off <= 1 then
@@ -86,15 +87,15 @@ begin
           -- Without run-length=1 acceleration, we can't copy more bytes at
           -- once than the copy offset, because we'd be reading beyond what
           -- we've written already.
-          if unsigned(c1h.cp_len(2 downto 0)) >= elh.cp_off and c1h.cp_len(3) = '0' then
-            c1h.cp_len(2 downto 0) := signed(resize(elh.cp_off(3 downto 0) - 1, 3));
+          if unsigned(c1h.cp_len(C_IDX-1 downto 0)) >= elh.cp_off and c1h.cp_len(C_IDX) = '0' then
+            c1h.cp_len(C_IDX-1 downto 0) := signed(resize(elh.cp_off(C_IDX downto 0) - 1, C_IDX));
 
             -- We can however accelerate subsequent copies; after the first
             -- copy we have two consecutive copies in memory, after the
-            -- second we have four, and so on. Note that cp_off bit 3 and above
-            -- must be zero here, because len was larger and len can be at most
-            -- 8, so we can ignore them in the leftshift.
-            elh.cp_off(3 downto 0) := elh.cp_off(2 downto 0) & "0";
+            -- second we have four, and so on. Note that cp_off bit C_IDX and
+            -- above must be zero here, because len was larger and len can be at
+            -- most C_BYTES, so we can ignore them in the leftshift.
+            elh.cp_off(C_IDX downto 0) := elh.cp_off(C_IDX-1 downto 0) & "0";
 
           end if;
 
@@ -103,7 +104,7 @@ begin
         end if;
 
         -- Update state.
-        cp_rem := cp_rem - (resize(c1h.cp_len, 5) + 1);
+        cp_rem := cp_rem - (resize(c1h.cp_len, cp_rem'length) + 1);
 
         -- Advance if there are no (more) bytes in the copy.
         if cp_rem(6) = '1' then

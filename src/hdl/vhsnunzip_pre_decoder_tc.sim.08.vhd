@@ -7,6 +7,7 @@ use ieee.numeric_std.all;
 use ieee.math_real.all;
 
 library work;
+use work.vhsnunzip_utils_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
 entity vhsnunzip_pre_decoder_tc is
@@ -131,7 +132,7 @@ begin
       end loop;
       cd_ready <= '0';
 
-      for i in 0 to 15 loop
+      for i in 0 to 2*C_BYTES-1 loop
         assert std_match(cd_v.data(i), cd.data(i)) severity failure;
       end loop;
       assert std_match(cd_v.first, cd.first) severity failure;

@@ -3,6 +3,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.vhsnunzip_utils_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
 -- Snappy decompression pipeline.
@@ -27,7 +28,7 @@ entity vhsnunzip_pipeline is
     -- for each chunk before chunk processing will start. Alternatively, in
     -- streaming mode with circular history, this can be left unconnected.
     lt_off_ld   : in  std_logic := '1';
-    lt_off      : in  unsigned(12 downto 0) := (others => '0');
+    lt_off      : in  unsigned(C_AW downto 0) := (others => '0');
 
     -- Long-term storage read enable and address stream. Both an odd and even
     -- line should be read. This stream should NOT be (significantly) FIFO'd
@@ -41,15 +42,15 @@ entity vhsnunzip_pipeline is
     -- result must be constant.
     lt_rd_valid : out std_logic;
     lt_rd_ready : in  std_logic := '1';
-    lt_rd_adev  : out unsigned(11 downto 0);
-    lt_rd_adod  : out unsigned(11 downto 0);
+    lt_rd_adev  : out unsigned(C_AW-1 downto 0);
+    lt_rd_adod  : out unsigned(C_AW-1 downto 0);
 
     -- Read data response signals. lt_rd_next should assert to indicate that
     -- the read data will be available in the *next* cycle. No backpressure
     -- support is needed here.
     lt_rd_next  : in  std_logic;
-    lt_rd_even  : in  byte_array(0 to 7);
-    lt_rd_odd   : in  byte_array(0 to 7);
+    lt_rd_even  : in  byte_array(0 to C_BYTES-1);
+    lt_rd_odd   : in  byte_array(0 to C_BYTES-1);
 
     -- pragma translate_off
     -- Debug outputs.
@@ -71,9 +72,26 @@ end vhsnunzip_pipeline;
 
 architecture behavior of vhsnunzip_pipeline is
 
+  -- Command-FIFO control word layout. The field offsets are derived from the
+  -- parametrised command_stream field widths so the packing tracks C_BYTES.
+  constant ST_W      : natural := 5;        -- st_addr (short-term depth, fixed)
+  constant ROL_W     : natural := C_WIN;    -- cp_rol / li_rol
+  constant END_W     : natural := C_CNT;    -- cp_end / li_end
+  constant O_LT_VAL  : natural := 0;
+  constant O_LT_SWAP : natural := O_LT_VAL + 1;
+  constant O_ST_ADDR : natural := O_LT_SWAP + 1;
+  constant O_CP_ROL  : natural := O_ST_ADDR + ST_W;
+  constant O_CP_RLE  : natural := O_CP_ROL + ROL_W;
+  constant O_CP_END  : natural := O_CP_RLE + 1;
+  constant O_LI_ROL  : natural := O_CP_END + END_W;
+  constant O_LI_END  : natural := O_LI_ROL + ROL_W;
+  constant O_LD_POP  : natural := O_LI_END + END_W;
+  constant O_LAST    : natural := O_LD_POP + 1;
+  constant CM_CTRL_W : natural := O_LAST + 1;
+
   -- Compressed data FIFO signals.
-  signal co_ctrl      : std_logic_vector(3 downto 0);
-  signal cs_ctrl      : std_logic_vector(3 downto 0);
+  signal co_ctrl      : std_logic_vector(C_IDX downto 0);
+  signal cs_ctrl      : std_logic_vector(C_IDX downto 0);
 
   -- Compressed line data stream.
   signal cs           : compressed_stream_single;
@@ -98,10 +116,10 @@ architecture behavior of vhsnunzip_pipeline is
 
   -- Command stream FIFO write-side signals.
   signal cm_push      : std_logic;
-  signal cm_ctrl      : std_logic_vector(25 downto 0);
+  signal cm_ctrl      : std_logic_vector(CM_CTRL_W-1 downto 0);
 
   -- Command stream FIFO read-side signals.
-  signal s1_cm_ctrl   : std_logic_vector(25 downto 0);
+  signal s1_cm_ctrl   : std_logic_vector(CM_CTRL_W-1 downto 0);
   signal s1_cm        : command_stream;
   signal s1_cm_exp    : command_stream;
 
@@ -114,61 +132,62 @@ architecture behavior of vhsnunzip_pipeline is
 
   -- Some array types.
   type srl_addr_array is array (natural range <>) of unsigned(4 downto 0);
-  type rol_array is array (natural range <>) of unsigned(2 downto 0);
+  type rol_array is array (natural range <>) of unsigned(C_IDX-1 downto 0);
 
   -- Literal SRL signals.
-  signal s2_li_addr   : srl_addr_array(0 to 7);
-  signal s2_li_data   : byte_array(0 to 7);
+  signal s2_li_addr   : srl_addr_array(0 to C_BYTES-1);
+  signal s2_li_data   : byte_array(0 to C_BYTES-1);
 
   -- Short-term memory SRL signals.
-  signal s2_st_addr   : srl_addr_array(0 to 7);
-  signal s2_st_data   : byte_array(0 to 7);
+  signal s2_st_addr   : srl_addr_array(0 to C_BYTES-1);
+  signal s2_st_data   : byte_array(0 to C_BYTES-1);
 
   -- Long-term memory data signals.
-  signal s2_le_data   : byte_array(0 to 7);
-  signal s2_lo_data   : byte_array(0 to 7);
+  signal s2_le_data   : byte_array(0 to C_BYTES-1);
+  signal s2_lo_data   : byte_array(0 to C_BYTES-1);
 
   -- Copy source mux.
   signal s2_lt_val    : std_logic;
-  signal s2_lt_sel    : std_logic_array(0 to 7);
-  signal s2_cp_data   : byte_array(0 to 7);
+  signal s2_lt_sel    : std_logic_array(0 to C_BYTES-1);
+  signal s2_cp_data   : byte_array(0 to C_BYTES-1);
 
   -- Rotator and copy/literal mux.
-  signal s2_rol_sel   : rol_array(0 to 7);
-  signal s2_mux_sel   : std_logic_array(0 to 7);
-  signal s2_mux_data  : byte_array(0 to 7);
+  signal s2_rol_sel   : rol_array(0 to C_BYTES-1);
+  signal s2_mux_sel   : std_logic_array(0 to C_BYTES-1);
+  signal s2_mux_data  : byte_array(0 to C_BYTES-1);
 
   -- Byte strobe signals. The internal strobe signals assert when the
   -- respective mux data output is valid for either the current line or the
   -- next line (output holding register), while the external strobe signal
   -- asserts only in the former case.
-  signal s2_int_strb  : std_logic_array(0 to 7);
-  signal s2_ext_strb  : std_logic_array(0 to 7);
+  signal s2_int_strb  : std_logic_array(0 to C_BYTES-1);
+  signal s2_ext_strb  : std_logic_array(0 to C_BYTES-1);
 
   -- Last flag and last valid byte index + one for stage 2.
   signal s2_last      : std_logic;
-  signal s2_cnt       : unsigned(2 downto 0);
+  signal s2_cnt       : unsigned(C_IDX-1 downto 0);
 
   -- Registered version of s2_cnt.
-  signal s3_cnt       : unsigned(2 downto 0);
+  signal s3_cnt       : unsigned(C_IDX-1 downto 0);
 
   -- Output holding register data, to support writing misaligned lines.
-  signal s3_hold_data : byte_array(0 to 7);
+  signal s3_hold_data : byte_array(0 to C_BYTES-1);
 
   -- Output data line and push signal.
   signal s3_out_push  : std_logic;
-  signal s3_out_data  : byte_array(0 to 7);
+  signal s3_out_data  : byte_array(0 to C_BYTES-1);
   signal s3_out_last  : std_logic;
-  signal s3_out_cnt   : unsigned(3 downto 0);
+  signal s3_out_cnt   : unsigned(C_CNT-1 downto 0);
 
   -- Signal which is set when the line indicated above was sent in response
   -- to the last datapath command, but isn't actually the last line because
   -- the command also wrote to the output holding register.
   signal s3_last_pend : std_logic;
 
-  -- Output FIFO signals.
-  signal s3_out_ctrl  : std_logic_vector(4 downto 0);
-  signal de_ctrl      : std_logic_vector(4 downto 0);
+  -- Output FIFO signals. The control word is the last flag plus the C_CNT-bit
+  -- valid-byte count.
+  signal s3_out_ctrl  : std_logic_vector(C_CNT downto 0);
+  signal de_ctrl      : std_logic_vector(C_CNT downto 0);
   signal de_level_s   : unsigned(5 downto 0);
   signal backpres     : std_logic;
 
@@ -180,12 +199,12 @@ begin
   -- but with this FIFO included it can. The FIFO level is also useful for the
   -- main memory port arbitration algorithms.
   co_ctrl(0) <= co.last;
-  co_ctrl(3 downto 1) <= std_logic_vector(co.endi);
+  co_ctrl(C_IDX downto 1) <= std_logic_vector(co.endi);
 
   co_fifo_inst: vhsnunzip_fifo
     generic map (
-      DATA_WIDTH  => 8,
-      CTRL_WIDTH  => 4
+      DATA_WIDTH  => C_BYTES,
+      CTRL_WIDTH  => C_IDX+1
     )
     port map (
       clk         => clk,
@@ -202,7 +221,7 @@ begin
     );
 
   cs.last <= cs_ctrl(0);
-  cs.endi <= unsigned(cs_ctrl(3 downto 1));
+  cs.endi <= unsigned(cs_ctrl(C_IDX downto 1));
 
   -- This is essentially an extension of the compressed data FIFO, but used
   -- exclusively for the literals. We use this to pass the literal data to the
@@ -214,7 +233,7 @@ begin
   -- include/test this SRL.
   cs_strobe <= cs.valid and cs_ready;
 
-  ld_srl_gen: for byte in 0 to 7 generate
+  ld_srl_gen: for byte in 0 to C_BYTES-1 generate
   begin
 
     srl_inst: vhsnunzip_srl
@@ -370,20 +389,20 @@ begin
   -- response should be significantly shorter than the command FIFO (otherwise
   -- the literal data FIFO would probably overflow first), so this FIFO should
   -- never overflow.
-  cm_ctrl(0) <= cm.lt_val;
-  cm_ctrl(1) <= cm.lt_swap;
-  cm_ctrl(6 downto 2) <= std_logic_vector(cm.st_addr);
-  cm_ctrl(10 downto 7) <= std_logic_vector(cm.cp_rol);
-  cm_ctrl(11) <= cm.cp_rle;
-  cm_ctrl(15 downto 12) <= std_logic_vector(cm.cp_end);
-  cm_ctrl(19 downto 16) <= std_logic_vector(cm.li_rol);
-  cm_ctrl(23 downto 20) <= std_logic_vector(cm.li_end);
-  cm_ctrl(24) <= cm.ld_pop;
-  cm_ctrl(25) <= cm.last;
+  cm_ctrl(O_LT_VAL) <= cm.lt_val;
+  cm_ctrl(O_LT_SWAP) <= cm.lt_swap;
+  cm_ctrl(O_ST_ADDR+ST_W-1 downto O_ST_ADDR) <= std_logic_vector(cm.st_addr);
+  cm_ctrl(O_CP_ROL+ROL_W-1 downto O_CP_ROL) <= std_logic_vector(cm.cp_rol);
+  cm_ctrl(O_CP_RLE) <= cm.cp_rle;
+  cm_ctrl(O_CP_END+END_W-1 downto O_CP_END) <= std_logic_vector(cm.cp_end);
+  cm_ctrl(O_LI_ROL+ROL_W-1 downto O_LI_ROL) <= std_logic_vector(cm.li_rol);
+  cm_ctrl(O_LI_END+END_W-1 downto O_LI_END) <= std_logic_vector(cm.li_end);
+  cm_ctrl(O_LD_POP) <= cm.ld_pop;
+  cm_ctrl(O_LAST) <= cm.last;
 
   cm_fifo_inst: vhsnunzip_fifo
     generic map (
-      CTRL_WIDTH  => 26
+      CTRL_WIDTH  => CM_CTRL_W
     )
     port map (
       clk         => clk,
@@ -395,16 +414,16 @@ begin
       rd_ctrl     => s1_cm_ctrl
     );
 
-  s1_cm.lt_val <= s1_cm_ctrl(0);
-  s1_cm.lt_swap <= s1_cm_ctrl(1);
-  s1_cm.st_addr <= unsigned(s1_cm_ctrl(6 downto 2));
-  s1_cm.cp_rol <= unsigned(s1_cm_ctrl(10 downto 7));
-  s1_cm.cp_rle <= s1_cm_ctrl(11);
-  s1_cm.cp_end <= unsigned(s1_cm_ctrl(15 downto 12));
-  s1_cm.li_rol <= unsigned(s1_cm_ctrl(19 downto 16));
-  s1_cm.li_end <= unsigned(s1_cm_ctrl(23 downto 20));
-  s1_cm.ld_pop <= s1_cm_ctrl(24);
-  s1_cm.last <= s1_cm_ctrl(25);
+  s1_cm.lt_val <= s1_cm_ctrl(O_LT_VAL);
+  s1_cm.lt_swap <= s1_cm_ctrl(O_LT_SWAP);
+  s1_cm.st_addr <= unsigned(s1_cm_ctrl(O_ST_ADDR+ST_W-1 downto O_ST_ADDR));
+  s1_cm.cp_rol <= unsigned(s1_cm_ctrl(O_CP_ROL+ROL_W-1 downto O_CP_ROL));
+  s1_cm.cp_rle <= s1_cm_ctrl(O_CP_RLE);
+  s1_cm.cp_end <= unsigned(s1_cm_ctrl(O_CP_END+END_W-1 downto O_CP_END));
+  s1_cm.li_rol <= unsigned(s1_cm_ctrl(O_LI_ROL+ROL_W-1 downto O_LI_ROL));
+  s1_cm.li_end <= unsigned(s1_cm_ctrl(O_LI_END+END_W-1 downto O_LI_END));
+  s1_cm.ld_pop <= s1_cm_ctrl(O_LD_POP);
+  s1_cm.last <= s1_cm_ctrl(O_LAST);
 
   -- Determine whether all data sources for stage 0 are ready. We just check
   -- the command stream and the long-term storage result (if we're expecting
@@ -426,29 +445,29 @@ begin
   s1_reg_proc: process (clk) is
 
     -- Whether there is data from the previous cycle in the line holding
-    -- register. Bit 7 of this is always zero, but included to reduce if
+    -- register. Bit C_BYTES-1 of this is always zero, but included to reduce if
     -- statement spam.
-    variable hold_valid   : std_logic_array(0 to 7) := (others => '0');
+    variable hold_valid   : std_logic_array(0 to C_BYTES-1) := (others => '0');
 
     -- Thermometer code for the copy and literal end signals. This plus
     -- hold_valid is used to construct the strobe, mux, and hold_valid signals
-    -- for the next cycle. Bit 15 of this is always zero, but included to
-    -- reduce if statement spam.
-    variable cp_end_th    : std_logic_array(0 to 15);
-    variable li_end_th    : std_logic_array(0 to 15);
+    -- for the next cycle. Bit 2*C_BYTES-1 of this is always zero, but included
+    -- to reduce if statement spam.
+    variable cp_end_th    : std_logic_array(0 to 2*C_BYTES-1);
+    variable li_end_th    : std_logic_array(0 to 2*C_BYTES-1);
 
     -- Arcane stuff described in the big comment block further down.
-    variable shift        : unsigned(2 downto 0);
-    type lookahead_lookup_type is array (natural range <>) of std_logic_array(0 to 127);
+    variable shift        : unsigned(C_IDX-1 downto 0);
+    type lookahead_lookup_type is array (natural range <>) of std_logic_array(0 to 2*C_BYTES*C_BYTES-1);
     function lookahead_lookup_fn return lookahead_lookup_type is
-      variable ret  : lookahead_lookup_type(0 to 7);
-      variable acc  : unsigned(3 downto 0);
+      variable ret  : lookahead_lookup_type(0 to C_BYTES-1);
+      variable acc  : unsigned(C_WIN-1 downto 0);
     begin
-      for byte in 0 to 7 loop
-        for shif in 0 to 7 loop
-          for rot in 0 to 15 loop
-            acc := to_unsigned(byte, 4) - rot - shif;
-            ret(byte)(shif * 16 + rot) := acc(3);
+      for byte in 0 to C_BYTES-1 loop
+        for shif in 0 to C_BYTES-1 loop
+          for rot in 0 to 2*C_BYTES-1 loop
+            acc := to_unsigned(byte, C_WIN) - rot - shif;
+            ret(byte)(shif * (2*C_BYTES) + rot) := acc(C_IDX);
           end loop;
         end loop;
       end loop;
@@ -471,7 +490,7 @@ begin
       s2_valid <= s1_valid;
       s2_lt_val <= s1_cm.lt_val;
       s2_last <= s1_cm.last and s1_valid;
-      s2_cnt <= s1_cm.li_end(2 downto 0);
+      s2_cnt <= s1_cm.li_end(C_IDX-1 downto 0);
 
       -- Update the literal FIFO level for the push action that's about to
       -- happen, before the address is used. Therefore we must do it before
@@ -481,14 +500,14 @@ begin
       end if;
 
       -- These bits are always zero!
-      hold_valid(7) := '0';
-      cp_end_th(15) := '0';
-      li_end_th(15) := '0';
+      hold_valid(C_BYTES-1) := '0';
+      cp_end_th(2*C_BYTES-1) := '0';
+      li_end_th(2*C_BYTES-1) := '0';
 
       -- Convert the cp_end and li_end signals into thermometer code. Note that
       -- if both are zero, everything below becomes no-op, and we have a LUT
       -- input extra here anyway.
-      for byte in 0 to 14 loop
+      for byte in 0 to 2*C_BYTES-2 loop
         if byte < s1_cm.cp_end then
           cp_end_th(byte) := s1_valid;
         else
@@ -502,16 +521,16 @@ begin
       end loop;
 
       -- Compute arcane value that we need later. See massive comment block.
-      if s1_cm.li_end(3) = '1' then
-        shift := s1_cm.li_end(2 downto 0);
+      if s1_cm.li_end(C_IDX) = '1' then
+        shift := s1_cm.li_end(C_IDX-1 downto 0);
       else
-        shift := "000";
+        shift := (others => '0');
       end if;
 
-      for byte in 0 to 7 loop
+      for byte in 0 to C_BYTES-1 loop
 
         -- Determine whether this byte is a literal or a copy.
-        if (cp_end_th(byte) = '1' and li_end_th(byte + 8) = '0') or cp_end_th(byte + 8) = '1' then
+        if (cp_end_th(byte) = '1' and li_end_th(byte + C_BYTES) = '0') or cp_end_th(byte + C_BYTES) = '1' then
 
           -- Before copy end on the current line, and not used for a literal
           -- on the next line, so this is a copied byte.
@@ -519,16 +538,16 @@ begin
 
           -- Compute rotate-left amounts for copy.
           if s1_cm.cp_rle = '1' then
-            s2_rol_sel(byte) <= s1_cm.cp_rol(2 downto 0) - byte;
+            s2_rol_sel(byte) <= s1_cm.cp_rol(C_IDX-1 downto 0) - byte;
           else
-            s2_rol_sel(byte) <= s1_cm.cp_rol(2 downto 0);
+            s2_rol_sel(byte) <= s1_cm.cp_rol(C_IDX-1 downto 0);
           end if;
 
         else
 
           -- Not a copied byte, so it's a literal.
           s2_mux_sel(byte) <= '0';
-          s2_rol_sel(byte) <= s1_cm.li_rol(2 downto 0);
+          s2_rol_sel(byte) <= s1_cm.li_rol(C_IDX-1 downto 0);
 
         end if;
 
@@ -651,10 +670,10 @@ begin
 
         -- Determine hold_valid and the strobe signals for the next cycle.
         s2_int_strb(byte) <= (li_end_th(byte) and not hold_valid(byte))
-                          or li_end_th(byte + 8);
+                          or li_end_th(byte + C_BYTES);
         s2_ext_strb(byte) <= li_end_th(byte) and not hold_valid(byte);
-        hold_valid(byte)  := ((hold_valid(byte) or li_end_th(byte)) and not li_end_th(7))
-                          or li_end_th(byte + 8);
+        hold_valid(byte)  := ((hold_valid(byte) or li_end_th(byte)) and not li_end_th(C_BYTES-1))
+                          or li_end_th(byte + C_BYTES);
 
       end loop;
 
@@ -678,7 +697,7 @@ begin
   end process;
 
   -- Short-term memory SRLs.
-  st_srl_gen: for byte in 0 to 7 generate
+  st_srl_gen: for byte in 0 to C_BYTES-1 generate
   begin
     srl_inst: vhsnunzip_srl
       generic map (
@@ -704,7 +723,7 @@ begin
     s2_lt_val, s2_lt_sel
   ) is
   begin
-    for byte in 0 to 7 loop
+    for byte in 0 to C_BYTES-1 loop
       if s2_lt_val = '0' then
         s2_cp_data(byte) <= s2_st_data(byte);
       elsif s2_lt_sel(byte) = '0' then
@@ -719,9 +738,9 @@ begin
   s2_mux_data_proc: process (
     s2_li_data, s2_cp_data, s2_rol_sel, s2_mux_sel
   ) is
-    variable idx  : unsigned(2 downto 0);
+    variable idx  : unsigned(C_IDX-1 downto 0);
   begin
-    for byte in 0 to 7 loop
+    for byte in 0 to C_BYTES-1 loop
       idx := s2_rol_sel(byte) + byte;
       if s2_mux_sel(byte) = '0' then
         s2_mux_data(byte) <= s2_li_data(to_integer(idx));
@@ -742,10 +761,10 @@ begin
       -- Assign defaults.
       s3_out_push <= '0';
       s3_out_last <= '0';
-      s3_out_cnt <= "1000";
+      s3_out_cnt <= to_unsigned(C_BYTES, C_CNT);
       s3_last_pend <= '0';
 
-      for byte in 0 to 7 loop
+      for byte in 0 to C_BYTES-1 loop
 
         -- Update the holding register only when the stage is valid and the
         -- byte strobe is set.
@@ -771,7 +790,7 @@ begin
         -- Inserted cycle to push out line holding register contents.
         s3_out_push <= '1';
         s3_out_last <= '1';
-        s3_out_cnt <= resize(s3_cnt, 4);
+        s3_out_cnt <= resize(s3_cnt, C_CNT);
 
       elsif s2_valid = '1' then
 
@@ -794,18 +813,18 @@ begin
             s3_out_push <= '1';
             s3_out_last <= '1';
 
-            -- If byte 7 was strobed, the last line happened to be a full line.
-            -- If it wasn't, we need to update the count to reflect the size of
-            -- the partial line.
-            if s2_ext_strb(7) = '0' then
-              s3_out_cnt <= resize(s2_cnt, 4);
+            -- If the last byte was strobed, the last line happened to be a full
+            -- line. If it wasn't, we need to update the count to reflect the
+            -- size of the partial line.
+            if s2_ext_strb(C_BYTES-1) = '0' then
+              s3_out_cnt <= resize(s2_cnt, C_CNT);
             end if;
 
           end if;
 
-        elsif s2_ext_strb(7) = '1' then
+        elsif s2_ext_strb(C_BYTES-1) = '1' then
 
-          -- Byte 7 was written, so we have a full line to push.
+          -- The last byte was written, so we have a full line to push.
           s3_out_push <= '1';
 
         end if;
@@ -822,12 +841,12 @@ begin
 
   -- Decompressed data output FIFO.
   s3_out_ctrl(0) <= s3_out_last;
-  s3_out_ctrl(4 downto 1) <= std_logic_vector(s3_out_cnt);
+  s3_out_ctrl(C_CNT downto 1) <= std_logic_vector(s3_out_cnt);
 
   de_fifo_inst: vhsnunzip_fifo
     generic map (
-      DATA_WIDTH  => 8,
-      CTRL_WIDTH  => 5
+      DATA_WIDTH  => C_BYTES,
+      CTRL_WIDTH  => C_CNT+1
     )
     port map (
       clk         => clk,
@@ -843,7 +862,7 @@ begin
     );
 
   de.last <= de_ctrl(0);
-  de.cnt <= unsigned(de_ctrl(4 downto 1));
+  de.cnt <= unsigned(de_ctrl(C_CNT downto 1));
   de_level <= de_level_s;
 
   -- Determine the maximum output FIFO level for which the command generator

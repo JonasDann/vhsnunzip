@@ -1,0 +1,20 @@
+#!/bin/bash
+# Dockerised GHDL shim for vhdeps.
+#
+# This environment has no native VHDL simulator, so we run GHDL from the
+# official ghdl/ghdl image. The repo and /tmp are mounted at identical paths so
+# the absolute source/work paths vhdeps passes resolve the same inside the
+# container. vhdeps simulates in a temporary working directory; the testbenches
+# read their *.tv vectors from the cwd, so we stage them in before each call.
+REPO=/local/home/jodann/oasis/parcore/vhsnunzip
+# Only stage vectors into the (temporary) sim working directory, which vhdeps
+# creates under /tmp. Never copy into source dirs (would collide with the
+# per-library symlinks vhdeps creates during analysis).
+case "$(pwd)" in
+  /tmp/*) cp -f "$REPO"/vhdl/*.tv "$(pwd)/" 2>/dev/null || true ;;
+esac
+exec docker run --rm -i \
+  -v /tmp:/tmp \
+  -v "$REPO:$REPO" \
+  -w "$(pwd)" -u "$(id -u):$(id -g)" -e HOME=/tmp \
+  ghdl/ghdl:ubuntu20-mcode ghdl "$@"

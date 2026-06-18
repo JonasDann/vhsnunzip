@@ -7,6 +7,7 @@ use ieee.numeric_std.all;
 use ieee.math_real.all;
 
 library work;
+use work.vhsnunzip_utils_pkg.all;
 use work.vhsnunzip_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
@@ -24,14 +25,14 @@ architecture testcase of vhsnunzip_unbuffered_tc is
 
   signal co_valid   : std_logic := '0';
   signal co_ready   : std_logic := '0';
-  signal co_data    : std_logic_vector(63 downto 0) := (others => '0');
-  signal co_cnt     : std_logic_vector(2 downto 0) := (others => '0');
+  signal co_data    : std_logic_vector(C_BYTES*8-1 downto 0) := (others => '0');
+  signal co_cnt     : std_logic_vector(C_IDX-1 downto 0) := (others => '0');
   signal co_last    : std_logic := '0';
 
   signal de_valid   : std_logic := '0';
   signal de_ready   : std_logic := '0';
-  signal de_data    : std_logic_vector(63 downto 0) := (others => '0');
-  signal de_cnt     : std_logic_vector(3 downto 0) := (others => '0');
+  signal de_data    : std_logic_vector(C_BYTES*8-1 downto 0) := (others => '0');
+  signal de_cnt     : std_logic_vector(C_CNT-1 downto 0) := (others => '0');
   signal de_dvalid  : std_logic := '0';
   signal de_last    : std_logic := '0';
 
@@ -106,7 +107,7 @@ begin
       stream_des(lin, co_v, true);
 
       co_valid <= co_v.valid;
-      for byte in 0 to 7 loop
+      for byte in 0 to C_BYTES-1 loop
         co_data(byte*8+7 downto byte*8) <= co_v.data(byte);
       end loop;
       co_cnt <= std_logic_vector(co_v.endi + 1);
@@ -157,12 +158,12 @@ begin
       end loop;
       de_ready <= '0';
 
-      for byte in 0 to 7 loop
+      for byte in 0 to C_BYTES-1 loop
         assert std_match(de_v.data(byte), de_data(byte*8+7 downto byte*8)) severity failure;
       end loop;
       assert std_match(de_v.last, de_last) severity failure;
       assert std_match(de_v.cnt, unsigned(de_cnt)) severity failure;
-      if de_cnt = "0000" then
+      if unsigned(de_cnt) = 0 then
         assert de_dvalid = '0' severity failure;
       else
         assert de_dvalid = '1' severity failure;

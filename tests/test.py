@@ -66,9 +66,14 @@ if vhdeps_target is not None:
         'vhsnunzip_cmd_gen_1_tc', 'vhsnunzip_cmd_gen_2_tc',
         'vhsnunzip_pipeline_tc', 'vhsnunzip_unbuffered_tc',
     ]
-    if max_chunk_size <= 65536:
+    # The buffered and multicore cores have hardcoded 8-byte-line geometry, so
+    # they only build/simulate at the default datapath width (WI == 8). The
+    # wide single-issue datapath (WI > 8) targets the unbuffered core only.
+    if max_chunk_size <= 65536 and WI == 8:
         test_cases.append('vhsnunzip_tc')
         test_cases.append('vhsnunzip_decoder_tc')
+    elif WI != 8:
+        print('NOTE: not simulating buffered/multicore core; WI != 8')
     else:
         print('NOTE: not simulating buffered core; chunk size > 64kiB')
     import vhdeps

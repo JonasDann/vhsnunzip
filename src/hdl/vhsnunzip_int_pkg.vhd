@@ -75,12 +75,12 @@ package vhsnunzip_int_pkg is
     valid     : std_logic;
 
     -- Compressed data line.
-    data      : byte_array(0 to 7);
+    data      : byte_array(0 to C_BYTES-1);
 
     -- Asserted to mark the last line of a chunk. When asserted, endi indicates
-    -- the index of the last valid byte. endi must be 7 otherwise.
+    -- the index of the last valid byte. endi must be C_BYTES-1 otherwise.
     last      : std_logic;
-    endi      : unsigned(2 downto 0);
+    endi      : unsigned(C_IDX-1 downto 0);
 
   end record;
 
@@ -103,21 +103,21 @@ package vhsnunzip_int_pkg is
 
     -- Two lines of compressed data. Reading elements that *start* after the
     -- first line is not legal, because not all of the lookahead line may be
-    -- valid. However, if an element starts at byte 7, as much of the second
-    -- line as is needed to encode the element should be valid, assuming that
-    -- the input is valid snappy data.
-    data      : byte_array(0 to 15);
+    -- valid. However, if an element starts at the last byte of the first line,
+    -- as much of the second line as is needed to encode the element should be
+    -- valid, assuming that the input is valid snappy data.
+    data      : byte_array(0 to 2*C_BYTES-1);
 
     -- Asserted to mark the first line of a chunk. When asserted, start
     -- indicates the byte index of the first element; start should be ignored
     -- otherwise.
     first     : std_logic;
-    start     : unsigned(2 downto 0);
+    start     : unsigned(C_IDX-1 downto 0);
 
     -- Asserted to mark the last line of a chunk. When asserted, endi indicates
-    -- the index of the last valid byte. endi must be 7 otherwise.
+    -- the index of the last valid byte. endi must be C_BYTES-1 otherwise.
     last      : std_logic;
-    endi      : unsigned(2 downto 0);
+    endi      : unsigned(C_IDX-1 downto 0);
 
   end record;
 
@@ -172,7 +172,7 @@ package vhsnunzip_int_pkg is
     -- stored DIMINISHED-ONE, just like the value in the Snappy header (this
     -- saves a bit).
     li_val    : std_logic;
-    li_off    : unsigned(3 downto 0);
+    li_off    : unsigned(C_WIN-1 downto 0);
     li_len    : unsigned(31 downto 0);
 
     -- Indicates that the literal data FIFO should be popped after this stream
@@ -232,7 +232,7 @@ package vhsnunzip_int_pkg is
     -- DIMINISHED-ONE, just like the value in the Snappy header (this saves a
     -- bit).
     cp_off    : unsigned(15 downto 0);
-    cp_len    : signed(3 downto 0);
+    cp_len    : signed(C_CNT-1 downto 0);
 
     -- Run-length encoding acceleration flag for rotations. When set, the
     -- constant (0, 1, 2, 3, 4, 5, 6, 7) should be added to cp_rol before the
@@ -249,7 +249,7 @@ package vhsnunzip_int_pkg is
     -- stored DIMINISHED-ONE, just like the value in the Snappy header (this
     -- saves a bit).
     li_val    : std_logic;
-    li_off    : unsigned(3 downto 0);
+    li_off    : unsigned(C_WIN-1 downto 0);
     li_len    : unsigned(31 downto 0);
 
     -- Indicates that the literal data FIFO should be popped after this stream
@@ -301,8 +301,8 @@ package vhsnunzip_int_pkg is
     -- Both an even and an odd line must be read, with independent addresses.
     -- They'll always be next to each other, but the even line index may be
     -- one later to read a "misaligned" line pair.
-    lt_adev   : unsigned(11 downto 0);
-    lt_adod   : unsigned(11 downto 0);
+    lt_adev   : unsigned(C_AW-1 downto 0);
+    lt_adod   : unsigned(C_AW-1 downto 0);
 
     -- When low, lt_adev is the address for the low line, and lt_adod is the
     -- address for the high line. When high, this is swapped.
@@ -337,37 +337,37 @@ package vhsnunzip_int_pkg is
     --  - the effect of lt_swap is inverted on a byte-by-byte basis based on
     --    cp_rol.
     --
-    cp_rol    : unsigned(3 downto 0);
+    cp_rol    : unsigned(C_WIN-1 downto 0);
 
     -- Run-length encoding acceleration flag for rotations. When set, the
-    -- constant (0, 1, 2, 3, 4, 5, 6, 7) should be added to cp_rol before the
-    -- main rotation is applied. Carry into bit 3 can be ignored; the high
+    -- constant (0, 1, 2, ..., C_BYTES-1) should be added to cp_rol before the
+    -- main rotation is applied. Carry into the MSB can be ignored; the high
     -- line is never actually used in the main rotator because of this number
-    -- and the fact that the decoder only outputs rotations between 0 and 7
-    -- when this is asserted. This all sounds a bit arcane, but what ultimately
-    -- happens because of this is simple: cp_rol is reduced to a byte index
-    -- within the two lines.
+    -- and the fact that the decoder only outputs rotations between 0 and
+    -- C_BYTES-1 when this is asserted. This all sounds a bit arcane, but what
+    -- ultimately happens because of this is simple: cp_rol is reduced to a byte
+    -- index within the two lines.
     cp_rle    : std_logic;
 
     -- This index indicates the last valid *copy* byte provided by this command
     -- + one. Bytes between cp_endi and endi are literal bytes. The copy
-    -- selection signals can be decoded from this in the same way that the 
+    -- selection signals can be decoded from this in the same way that the
     -- byte strobe signals are determined from endi.
-    cp_end    : unsigned(3 downto 0);
+    cp_end    : unsigned(C_CNT-1 downto 0);
 
     -- Rotation for literals. The direction is rotate-left. The MSB should be
     -- handled by offsetting the SRL literal read by one line on a byte-by-byte
     -- basis, in the same way that the short-term memory read handles this. The
-    -- remaining 3 LSBs must be handled by the main 8:8 rotator.
-    li_rol    : unsigned(3 downto 0);
+    -- remaining LSBs must be handled by the main C_BYTES:C_BYTES rotator.
+    li_rol    : unsigned(C_WIN-1 downto 0);
 
     -- Index of the last valid byte provided by this command + one. The byte
     -- strobe signals can be derived from this thermometer-code style, ignoring
     -- any bytes that were already written. Overflow past the current line
-    -- (endi > 8) should be written to a holding register, as the beginning for
-    -- the next line. The MSB therefore indicates that an aligned line of
-    -- decompressed data is complete.
-    li_end    : unsigned(3 downto 0);
+    -- (endi > C_BYTES) should be written to a holding register, as the
+    -- beginning for the next line. The MSB therefore indicates that an aligned
+    -- line of decompressed data is complete.
+    li_end    : unsigned(C_CNT-1 downto 0);
 
     -- Indicates that the literal data FIFO should be popped after this command
     -- has been handled.
@@ -407,7 +407,7 @@ package vhsnunzip_int_pkg is
       c1          : in  partial_command_stream;
       c1_ready    : out std_logic;
       lt_off_ld   : in  std_logic := '1';
-      lt_off      : in  unsigned(12 downto 0) := (others => '0');
+      lt_off      : in  unsigned(C_AW downto 0) := (others => '0');
       cm          : out command_stream;
       cm_ready    : in  std_logic
     );
@@ -420,14 +420,15 @@ package vhsnunzip_int_pkg is
     valid     : std_logic;
 
     -- Decompressed data line.
-    data      : byte_array(0 to 7);
+    data      : byte_array(0 to C_BYTES-1);
 
     -- Asserted to mark the last line of a chunk.
     last      : std_logic;
 
-    -- Indicates the number of valid bytes. This is always 8 when last is not
-    -- set, but could be anything from 0 to 8 inclusive for the last transfer.
-    cnt       : unsigned(3 downto 0);
+    -- Indicates the number of valid bytes. This is always C_BYTES when last is
+    -- not set, but could be anything from 0 to C_BYTES inclusive for the last
+    -- transfer.
+    cnt       : unsigned(C_CNT-1 downto 0);
 
   end record;
 
@@ -452,14 +453,14 @@ package vhsnunzip_int_pkg is
       co_ready    : out std_logic;
       co_level    : out unsigned(5 downto 0);
       lt_off_ld   : in  std_logic := '1';
-      lt_off      : in  unsigned(12 downto 0) := (others => '0');
+      lt_off      : in  unsigned(C_AW downto 0) := (others => '0');
       lt_rd_valid : out std_logic;
       lt_rd_ready : in  std_logic := '1';
-      lt_rd_adev  : out unsigned(11 downto 0);
-      lt_rd_adod  : out unsigned(11 downto 0);
+      lt_rd_adev  : out unsigned(C_AW-1 downto 0);
+      lt_rd_adod  : out unsigned(C_AW-1 downto 0);
       lt_rd_next  : in  std_logic;
-      lt_rd_even  : in  byte_array(0 to 7);
-      lt_rd_odd   : in  byte_array(0 to 7);
+      lt_rd_even  : in  byte_array(0 to C_BYTES-1);
+      lt_rd_odd   : in  byte_array(0 to C_BYTES-1);
       -- pragma translate_off
       dbg_cs      : out compressed_stream_single;
       dbg_cd      : out compressed_stream_double;
@@ -481,13 +482,13 @@ package vhsnunzip_int_pkg is
     valid         : std_logic;
 
     -- Read/write address.
-    addr          : unsigned(11 downto 0);
+    addr          : unsigned(C_AW-1 downto 0);
 
     -- Set high to write, low to read.
     wren          : std_logic;
 
     -- Data to write.
-    wdat          : byte_array(0 to 7);
+    wdat          : byte_array(0 to C_BYTES-1);
 
     -- Control info to write (saved in parity bit storage).
     wctrl         : std_logic_vector(7 downto 0);
@@ -506,7 +507,7 @@ package vhsnunzip_int_pkg is
     valid_next    : std_logic;
 
     -- Data that was read.
-    rdat          : byte_array(0 to 7);
+    rdat          : byte_array(0 to C_BYTES-1);
 
     -- Control info that was read..
     rctrl         : std_logic_vector(7 downto 0);
@@ -543,16 +544,16 @@ package vhsnunzip_int_pkg is
     hipri         : std_logic;
 
     -- Read/write address for the even and odd line.
-    ev_addr       : unsigned(11 downto 0);
-    od_addr       : unsigned(11 downto 0);
+    ev_addr       : unsigned(C_AW-1 downto 0);
+    od_addr       : unsigned(C_AW-1 downto 0);
 
     -- Set high to write, low to read; again for the even and odd line.
     ev_wren       : std_logic;
     od_wren       : std_logic;
 
     -- Data to write.
-    ev_wdat       : byte_array(0 to 7);
-    od_wdat       : byte_array(0 to 7);
+    ev_wdat       : byte_array(0 to C_BYTES-1);
+    od_wdat       : byte_array(0 to C_BYTES-1);
 
     -- Control info to write (saved in parity bit storage).
     ev_wctrl      : std_logic_vector(7 downto 0);

@@ -3,6 +3,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.vhsnunzip_utils_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
 -- Behavioral description of a Xilinx ultra or collection of 8 BRAMs. 4k deep,
@@ -41,11 +42,11 @@ architecture behavior of vhsnunzip_ram is
   constant RESP_STAGES  : natural := 1;
 
   type ram_line is record
-    data  : byte_array(0 to 7);
+    data  : byte_array(0 to C_BYTES-1);
     ctrl  : std_logic_vector(7 downto 0);
   end record;
   type ram_array is array (natural range <>) of ram_line;
-  signal ram : ram_array(0 to 4095);
+  signal ram : ram_array(0 to 2**C_AW-1);
 
 begin
   reg_proc: process (clk) is

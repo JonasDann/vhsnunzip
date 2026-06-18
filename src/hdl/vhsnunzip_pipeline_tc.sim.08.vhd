@@ -7,6 +7,7 @@ use ieee.numeric_std.all;
 use ieee.math_real.all;
 
 library work;
+use work.vhsnunzip_utils_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
 entity vhsnunzip_pipeline_tc is
@@ -41,24 +42,24 @@ architecture testcase of vhsnunzip_pipeline_tc is
 
   signal lt_valid   : std_logic;
   signal lt_ready   : std_logic;
-  signal lt_adev    : unsigned(11 downto 0);
-  signal lt_adod    : unsigned(11 downto 0);
+  signal lt_adev    : unsigned(C_AW-1 downto 0);
+  signal lt_adod    : unsigned(C_AW-1 downto 0);
   signal lt_next    : std_logic;
-  signal lt_even    : byte_array(0 to 7);
-  signal lt_odd     : byte_array(0 to 7);
+  signal lt_even    : byte_array(0 to C_BYTES-1);
+  signal lt_odd     : byte_array(0 to C_BYTES-1);
 
   type lt_stage is record
     valid           : std_logic;
-    even            : byte_array(0 to 7);
-    odd             : byte_array(0 to 7);
+    even            : byte_array(0 to C_BYTES-1);
+    odd             : byte_array(0 to C_BYTES-1);
   end record;
   type lt_pipeline is array (natural range <>) of lt_stage;
   signal lt_stages  : lt_pipeline(0 to 5);
 
-  type lt_mem_array is array (natural range <>) of byte_array(0 to 7);
-  signal lt_mem_ev  : lt_mem_array(0 to 4095);
-  signal lt_mem_od  : lt_mem_array(0 to 4095);
-  signal lt_ptr     : unsigned(12 downto 0) := (others => '0');
+  type lt_mem_array is array (natural range <>) of byte_array(0 to C_BYTES-1);
+  signal lt_mem_ev  : lt_mem_array(0 to 2**C_AW-1);
+  signal lt_mem_od  : lt_mem_array(0 to 2**C_AW-1);
+  signal lt_ptr     : unsigned(C_AW downto 0) := (others => '0');
 
 begin
 
@@ -178,7 +179,7 @@ begin
       end loop;
       de_ready <= '0';
 
-      for i in 0 to 7 loop
+      for i in 0 to C_BYTES-1 loop
         assert std_match(de_v.data(i), de.data(i)) severity failure;
       end loop;
       assert std_match(de_v.last, de.last) severity failure;
@@ -234,9 +235,9 @@ begin
           lt_ptr <= (others => '0');
         else
           if lt_ptr(0) = '0' then
-            lt_mem_ev(to_integer(lt_ptr(12 downto 1))) <= de.data;
+            lt_mem_ev(to_integer(lt_ptr(C_AW downto 1))) <= de.data;
           else
-            lt_mem_od(to_integer(lt_ptr(12 downto 1))) <= de.data;
+            lt_mem_od(to_integer(lt_ptr(C_AW downto 1))) <= de.data;
           end if;
           lt_ptr <= lt_ptr + 1;
         end if;
@@ -279,7 +280,7 @@ begin
         exit when dbg_cs.valid = '1';
       end loop;
 
-      for i in 0 to 7 loop
+      for i in 0 to C_BYTES-1 loop
         assert std_match(cs_v.data(i), dbg_cs.data(i)) severity failure;
       end loop;
       assert std_match(cs_v.last, dbg_cs.last) severity failure;
@@ -311,7 +312,7 @@ begin
         exit when dbg_cd.valid = '1';
       end loop;
 
-      for i in 0 to 15 loop
+      for i in 0 to 2*C_BYTES-1 loop
         assert std_match(cd_v.data(i), dbg_cd.data(i)) severity failure;
       end loop;
       assert std_match(cd_v.first, dbg_cd.first) severity failure;

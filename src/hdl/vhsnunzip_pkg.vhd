@@ -1,6 +1,9 @@
 library ieee;
 use ieee.std_logic_1164.all;
 
+library work;
+use work.vhsnunzip_utils_pkg.all;
+
 -- Package containing toplevel component declarations for vhsnunzip.
 package vhsnunzip_pkg is
 
@@ -17,14 +20,14 @@ package vhsnunzip_pkg is
       reset       : in  std_logic;
       co_valid    : in  std_logic;
       co_ready    : out std_logic;
-      co_data     : in  std_logic_vector(63 downto 0);
-      co_cnt      : in  std_logic_vector(2 downto 0);
+      co_data     : in  std_logic_vector(C_BYTES*8-1 downto 0);
+      co_cnt      : in  std_logic_vector(C_IDX-1 downto 0);
       co_last     : in  std_logic;
       de_valid    : out std_logic;
       de_ready    : in  std_logic;
       de_dvalid   : out std_logic;
-      de_data     : out std_logic_vector(63 downto 0);
-      de_cnt      : out std_logic_vector(3 downto 0);
+      de_data     : out std_logic_vector(C_BYTES*8-1 downto 0);
+      de_cnt      : out std_logic_vector(C_CNT-1 downto 0);
       de_last     : out std_logic
     );
   end component;

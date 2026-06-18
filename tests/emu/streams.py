@@ -11,7 +11,7 @@ from .utils import *
 # Data width. This is fixed to 8 in the VHDL source, but can be modified to
 # other powers of two here. Less than 4 definitely won't work, 4 may work,
 # more than 8 should work fine but won't work in hardware with URAMs.
-WI = 8
+WI = 16
 WB = WI.bit_length() - 1
 
 _CompressedStreamSingle = namedtuple('_CompressedStreamSingle', [
@@ -57,7 +57,7 @@ class CompressedStreamDouble(_CompressedStreamDouble):
         cd = super(CompressedStreamDouble, cls).__new__(cls, *args, **kwargs)
         assert is_byte_array(cd.data, WI*2)
         assert is_std_logic(cd.first)
-        assert is_unsigned(cd.start, 3)
+        assert is_unsigned(cd.start, WB)
         assert is_std_logic(cd.last)
         assert is_unsigned(cd.endi, WB)
         assert cd.endi == WI-1 or cd.last
@@ -68,7 +68,7 @@ class CompressedStreamDouble(_CompressedStreamDouble):
         for idx, value in enumerate(self.data):
             s.append(binary(value, 8, idx <= self.py_endi and (not self.first or idx >= self.start)))
         s.append(binary(self.first, 1))
-        s.append(binary(self.start, 3, self.first))
+        s.append(binary(self.start, WB, self.first))
         s.append(binary(self.last, 1))
         s.append(binary(self.endi, WB))
         return ''.join(s)

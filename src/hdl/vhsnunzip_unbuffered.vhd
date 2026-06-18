@@ -3,6 +3,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.vhsnunzip_utils_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
 -- Streaming toplevel for vhsnunzip. This version of the decompressor doesn't
@@ -46,8 +47,8 @@ entity vhsnunzip_unbuffered is
     -- stream library components in vhlib.
     co_valid    : in  std_logic;
     co_ready    : out std_logic;
-    co_data     : in  std_logic_vector(63 downto 0);
-    co_cnt      : in  std_logic_vector(2 downto 0);
+    co_data     : in  std_logic_vector(C_BYTES*8-1 downto 0);
+    co_cnt      : in  std_logic_vector(C_IDX-1 downto 0);
     co_last     : in  std_logic;
 
     -- Decompressed output stream. This stream is almost normalized, with the
@@ -59,8 +60,8 @@ entity vhsnunzip_unbuffered is
     de_valid    : out std_logic;
     de_ready    : in  std_logic;
     de_dvalid   : out std_logic;
-    de_data     : out std_logic_vector(63 downto 0);
-    de_cnt      : out std_logic_vector(3 downto 0);
+    de_data     : out std_logic_vector(C_BYTES*8-1 downto 0);
+    de_cnt      : out std_logic_vector(C_CNT-1 downto 0);
     de_last     : out std_logic
 
   );
@@ -73,14 +74,14 @@ architecture behavior of vhsnunzip_unbuffered is
   signal de           : decompressed_stream;
   signal lt_rd_valid  : std_logic;
   signal lt_rd_val_r  : std_logic;
-  signal lt_rd_adev   : unsigned(11 downto 0);
-  signal lt_rd_adod   : unsigned(11 downto 0);
+  signal lt_rd_adev   : unsigned(C_AW-1 downto 0);
+  signal lt_rd_adod   : unsigned(C_AW-1 downto 0);
   signal lt_rd_next   : std_logic;
-  signal lt_rd_even   : byte_array(0 to 7);
-  signal lt_rd_odd    : byte_array(0 to 7);
+  signal lt_rd_even   : byte_array(0 to C_BYTES-1);
+  signal lt_rd_odd    : byte_array(0 to C_BYTES-1);
 
   -- RAM interface signals.
-  signal wr_ptr       : unsigned(12 downto 0);
+  signal wr_ptr       : unsigned(C_AW downto 0);
   signal ev_wr_cmd    : ram_command;
   signal ev_rd_cmd    : ram_command;
   signal ev_rd_resp   : ram_response;
@@ -115,7 +116,7 @@ begin
   co_connect_proc: process (co_valid, co_data, co_cnt, co_last) is
   begin
     co.valid <= co_valid;
-    for byte in 0 to 7 loop
+    for byte in 0 to C_BYTES-1 loop
       co.data(byte) <= co_data(byte*8+7 downto byte*8);
     end loop;
     co.endi <= unsigned(co_cnt) - 1;
@@ -125,7 +126,7 @@ begin
   de_connect_proc: process (de) is
   begin
     de_valid <= de.valid;
-    for byte in 0 to 7 loop
+    for byte in 0 to C_BYTES-1 loop
       de_data(byte*8+7 downto byte*8) <= de.data(byte);
     end loop;
     de_cnt <= std_logic_vector(de.cnt);
@@ -141,14 +142,14 @@ begin
   -- storage.
   ev_wr_cmd <= (
     valid => de.valid and de_ready and not wr_ptr(0),
-    addr  => wr_ptr(12 downto 1),
+    addr  => wr_ptr(C_AW downto 1),
     wren  => '1',
     wdat  => de.data,
     wctrl => "00000000");
 
   od_wr_cmd <= (
     valid => de.valid and de_ready and wr_ptr(0),
-    addr  => wr_ptr(12 downto 1),
+    addr  => wr_ptr(C_AW downto 1),
     wren  => '1',
     wdat  => de.data,
     wctrl => "00000000");

@@ -3,6 +3,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.vhsnunzip_utils_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
 -- Compressed data stream preprocessor.
@@ -69,30 +70,30 @@ begin
       -- Transfer from the current input to the output.
       if cdh.valid = '0' then
         cdh.valid := cur.valid;
-        cdh.data(0 to 7) := cur.data;
-        cdh.data(8 to 15) := nxt.data;
+        cdh.data(0 to C_BYTES-1) := cur.data;
+        cdh.data(C_BYTES to 2*C_BYTES-1) := nxt.data;
         cdh.first := first;
 
         -- Seek past the uncompressed size varint.
         if LONG_CHUNKS then
           if cur.data(0)(7) = '0' then
-            cdh.start := "001";
+            cdh.start := to_unsigned(1, C_IDX);
           elsif cur.data(1)(7) = '0' then
-            cdh.start := "010";
+            cdh.start := to_unsigned(2, C_IDX);
           elsif cur.data(2)(7) = '0' then
-            cdh.start := "011";
+            cdh.start := to_unsigned(3, C_IDX);
           elsif cur.data(3)(7) = '0' then
-            cdh.start := "100";
+            cdh.start := to_unsigned(4, C_IDX);
           else
-            cdh.start := "101";
+            cdh.start := to_unsigned(5, C_IDX);
           end if;
         else
           if cur.data(0)(7) = '0' then
-            cdh.start := "001";
+            cdh.start := to_unsigned(1, C_IDX);
           elsif cur.data(1)(7) = '0' then
-            cdh.start := "010";
+            cdh.start := to_unsigned(2, C_IDX);
           else
-            cdh.start := "011";
+            cdh.start := to_unsigned(3, C_IDX);
           end if;
         end if;
 
