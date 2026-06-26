@@ -38,6 +38,26 @@ package vhsnunzip_utils_pkg is
   constant C_CNT : positive := clog2(C_BYTES) + 1;
   constant C_WIN : positive := clog2(2 * C_BYTES);
 
+  -- Number of speculative element-1 start offsets the dual-issue decoder
+  -- evaluates, and the global default for the SPEC_OFFSETS generic exposed by
+  -- each toplevel. It doubles as the datapath selector in vhsnunzip_unbuffered:
+  --
+  --   0   -> the proven single-issue datapath (vhsnunzip_pipeline): one Snappy
+  --          element per cycle. This is the default.
+  --   N>0 -> the speculative dual-issue datapath (vhsnunzip_pipeline_dual): its
+  --          decoder emits a second element per cycle by decoding it in parallel
+  --          at element-0 end-offsets {2, 3, ..., N+1} (the smallest element is
+  --          2 bytes) and selecting the slot matching element 0's actual size,
+  --          which breaks the chained element0->element1 decode that would
+  --          otherwise dominate the critical path.
+  --
+  -- Element 0's start offset is line-local (0 .. C_BYTES-1) and its size is at
+  -- most C_BYTES-1, so N = C_BYTES-2 gives full coverage (every reachable
+  -- element-0 size pairs). Smaller N trades dual-issue rate -- element-0 sizes
+  -- larger than N+1 fall back to one element that cycle, always correct -- for a
+  -- smaller element1 selection mux (less area, shorter path).
+  constant C_SPEC_OFFSETS : natural := 0;
+
   -- Per-bank long-term memory line-address width. The 64kiB history window is
   -- split into an even and an odd bank of C_BYTES-byte lines, so each bank
   -- holds 32768/C_BYTES lines. The combined (virtual) line pointer is C_AW+1

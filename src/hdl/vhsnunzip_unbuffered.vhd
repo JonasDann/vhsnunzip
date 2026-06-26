@@ -19,6 +19,12 @@ entity vhsnunzip_unbuffered is
     -- the core will be a couple hundred LUTs smaller.
     LONG_CHUNKS : boolean := true;
 
+    -- Number of speculative element-1 start offsets the dual-issue decoder
+    -- evaluates. 0 selects the proven single-issue datapath; any value > 0
+    -- selects the speculative dual-issue datapath with that many offsets. See
+    -- C_SPEC_OFFSETS in vhsnunzip_utils_pkg.
+    SPEC_OFFSETS : natural := C_SPEC_OFFSETS;
+
     -- This block can use either 2 UltraRAMs or 16 Xilinx 36k block RAMs.
     -- Select "ultra" for UltraRAMs or "block" for block RAMs.
     RAM_STYLE   : string := "ultra"
@@ -80,6 +86,14 @@ architecture behavior of vhsnunzip_unbuffered is
   signal lt_rd_even   : byte_array(0 to C_BYTES-1);
   signal lt_rd_odd    : byte_array(0 to C_BYTES-1);
 
+  -- Second long-term read port (dual-issue cm1), backed by a URAM mirror.
+  signal lt_rd_valid1 : std_logic;
+  signal lt_rd_adev1  : unsigned(C_AW-1 downto 0);
+  signal lt_rd_adod1  : unsigned(C_AW-1 downto 0);
+  signal lt_rd_next1  : std_logic;
+  signal lt_rd_even1  : byte_array(0 to C_BYTES-1);
+  signal lt_rd_odd1   : byte_array(0 to C_BYTES-1);
+
   -- RAM interface signals.
   signal wr_ptr       : unsigned(C_AW downto 0);
   signal ev_wr_cmd    : ram_command;
@@ -89,27 +103,66 @@ architecture behavior of vhsnunzip_unbuffered is
   signal od_rd_cmd    : ram_command;
   signal od_rd_resp   : ram_response;
 
+  -- Mirror RAM read interface (cm1 read port; written identically).
+  signal ev_rd_cmd1   : ram_command;
+  signal ev_rd_resp1  : ram_response;
+  signal od_rd_cmd1   : ram_command;
+  signal od_rd_resp1  : ram_response;
+
 begin
 
-  -- Datapath.
-  datapath_inst: vhsnunzip_pipeline
-    generic map (
-      LONG_CHUNKS => LONG_CHUNKS
-    )
-    port map (
-      clk         => clk,
-      reset       => reset,
-      co          => co,
-      co_ready    => co_ready,
-      lt_rd_valid => lt_rd_valid,
-      lt_rd_adev  => lt_rd_adev,
-      lt_rd_adod  => lt_rd_adod,
-      lt_rd_next  => lt_rd_next,
-      lt_rd_even  => lt_rd_even,
-      lt_rd_odd   => lt_rd_odd,
-      de          => de,
-      de_ready    => de_ready
-    );
+  -- Datapath. The single-issue pipeline and the speculative dual-issue (fold)
+  -- pipeline have identical ports (minus the sim-only debug taps), so
+  -- SPEC_OFFSETS just selects which one is instantiated: 0 -> single-issue,
+  -- > 0 -> dual-issue with that many speculative offsets.
+  single_datapath_gen: if SPEC_OFFSETS = 0 generate
+    datapath_inst: vhsnunzip_pipeline
+      generic map (
+        LONG_CHUNKS => LONG_CHUNKS
+      )
+      port map (
+        clk         => clk,
+        reset       => reset,
+        co          => co,
+        co_ready    => co_ready,
+        lt_rd_valid => lt_rd_valid,
+        lt_rd_adev  => lt_rd_adev,
+        lt_rd_adod  => lt_rd_adod,
+        lt_rd_next  => lt_rd_next,
+        lt_rd_even  => lt_rd_even,
+        lt_rd_odd   => lt_rd_odd,
+        de          => de,
+        de_ready    => de_ready
+      );
+  end generate;
+
+  dual_datapath_gen: if SPEC_OFFSETS > 0 generate
+    datapath_inst: vhsnunzip_pipeline_dual
+      generic map (
+        LONG_CHUNKS => LONG_CHUNKS,
+        SPEC_OFFSETS => SPEC_OFFSETS
+      )
+      port map (
+        clk          => clk,
+        reset        => reset,
+        co           => co,
+        co_ready     => co_ready,
+        lt_rd_valid  => lt_rd_valid,
+        lt_rd_adev   => lt_rd_adev,
+        lt_rd_adod   => lt_rd_adod,
+        lt_rd_next   => lt_rd_next,
+        lt_rd_even   => lt_rd_even,
+        lt_rd_odd    => lt_rd_odd,
+        lt_rd_valid1 => lt_rd_valid1,
+        lt_rd_adev1  => lt_rd_adev1,
+        lt_rd_adod1  => lt_rd_adod1,
+        lt_rd_next1  => lt_rd_next1,
+        lt_rd_even1  => lt_rd_even1,
+        lt_rd_odd1   => lt_rd_odd1,
+        de           => de,
+        de_ready     => de_ready
+      );
+  end generate;
 
   -- To improve tool compatibility, avoid non-std_logic types on the toplevel.
   -- Also convert to/from vhlib's stream interface where applicable.
@@ -216,5 +269,60 @@ begin
       b_cmd     => od_rd_cmd,
       b_resp    => od_rd_resp
     );
+
+  -- Mirror of the long-term history for the dual-issue cm1 read port. The mirror
+  -- banks are written identically to the primary banks (same decompressed output
+  -- on the write port), and read independently at cm1's address, giving cm0 and
+  -- cm1 independent long-term read ports. Only instantiated for the dual-issue
+  -- datapath; single-issue leaves the second port unused.
+  lt_mirror_gen: if SPEC_OFFSETS > 0 generate
+
+    ev_rd_cmd1 <= (
+      valid => lt_rd_valid1,
+      addr  => lt_rd_adev1,
+      wren  => '0',
+      wdat  => (others => X"00"),
+      wctrl => "00000000");
+
+    od_rd_cmd1 <= (
+      valid => lt_rd_valid1,
+      addr  => lt_rd_adod1,
+      wren  => '0',
+      wdat  => (others => X"00"),
+      wctrl => "00000000");
+
+    lt_rd_even1 <= ev_rd_resp1.rdat;
+    lt_rd_odd1  <= od_rd_resp1.rdat;
+    lt_rd_next1 <= od_rd_resp1.valid_next;
+
+    -- Mirror of the even lines.
+    ram_even1_inst: vhsnunzip_ram
+      generic map (
+        RAM_STYLE => RAM_STYLE
+      )
+      port map (
+        clk       => clk,
+        reset     => reset,
+        a_cmd     => ev_wr_cmd,
+        a_resp    => open,
+        b_cmd     => ev_rd_cmd1,
+        b_resp    => ev_rd_resp1
+      );
+
+    -- Mirror of the odd lines.
+    ram_odd1_inst: vhsnunzip_ram
+      generic map (
+        RAM_STYLE => RAM_STYLE
+      )
+      port map (
+        clk       => clk,
+        reset     => reset,
+        a_cmd     => od_wr_cmd,
+        a_resp    => open,
+        b_cmd     => od_rd_cmd1,
+        b_resp    => od_rd_resp1
+      );
+
+  end generate;
 
 end behavior;

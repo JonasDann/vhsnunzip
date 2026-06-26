@@ -13,6 +13,7 @@ package vhsnunzip_pkg is
   component vhsnunzip_unbuffered is
     generic (
       LONG_CHUNKS : boolean := true;
+      SPEC_OFFSETS : natural := C_SPEC_OFFSETS;
       RAM_STYLE   : string := "ultra"
     );
     port (

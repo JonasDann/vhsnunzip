@@ -193,6 +193,8 @@ _CommandStream = namedtuple('_CommandStream', [
     'last',     # indicator for last command in chunk
     'py_data',  # literal data that accompanies this block, doesn't exist in hardware
     'py_start', # start index for valid bytes, computed from context in hardware
+    'py_cp_off',# semantic copy offset for this command, doesn't exist in hardware
+    'py_li',    # literal bytes written by this command, doesn't exist in hardware
 ])
 
 class CommandStream(_CommandStream):
@@ -228,6 +230,27 @@ class CommandStream(_CommandStream):
         s.append(binary(self.li_rol, WB+1, li_val))
         s.append(binary(self.li_end, WB+1, li_val))
         s.append(binary(self.ld_pop, 1))
+        s.append(binary(self.last, 1))
+        return ''.join(s)
+
+    def serialize_exec(self):
+        """Serialize the *semantic* command for the dual-issue execute model:
+        copy byte count, copy offset, literal byte count, the literal bytes
+        themselves, and the last flag. This is what the behavioral dual execute
+        consumes (the literal bytes stand in for the literal-data FIFO, which the
+        Python model also does not model). Not used in hardware."""
+        cp_count = self.cp_end - self.py_start
+        li_count = self.li_end - self.cp_end
+        assert 0 <= cp_count <= WI
+        assert 0 <= li_count <= WI
+        assert li_count == len(self.py_li)
+        li = list(self.py_li) + [0] * (WI - li_count)
+        s = []
+        s.append(binary(cp_count, WB+1))
+        s.append(binary(self.py_cp_off, 16, cp_count > 0))
+        s.append(binary(li_count, WB+1))
+        for idx, value in enumerate(li):
+            s.append(binary(value, 8, idx < li_count))
         s.append(binary(self.last, 1))
         return ''.join(s)
 

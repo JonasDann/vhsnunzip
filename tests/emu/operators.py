@@ -316,6 +316,11 @@ def cmd_gen_2(partial_commands):
         if li_off >= WI:
             li_chunk_len = 0
 
+        # Capture the literal bytes this command writes (model-only). The data
+        # comes from the literal window of the current record at the current
+        # li_off, before li_off is advanced for the next chunk.
+        py_li = tuple(c1h.py_data[li_off + m] for m in range(li_chunk_len))
+
         li_rol = (li_off - off) & (WI*2-1)
 
         # Update state for literal.
@@ -355,7 +360,7 @@ def cmd_gen_2(partial_commands):
             lt_val, lt_adev, lt_adod, lt_swap,
             st_addr, cp_rol, c1h.cp_rle, cp_end,
             li_rol, li_end, ld_pop, last,
-            c1h.py_data, py_start)
+            c1h.py_data, py_start, c1h.cp_off, py_li)
 
 
 class SRL:
@@ -599,6 +604,366 @@ def datapath(commands):
                 oh_valid[byte] = False
 
 
+def datapath_dual(commands, counters=None):
+    """Dual-issue datapath reference model (contained 16 B/cycle "fold").
+
+    Executes up to two single-issue commands per cycle, *folding* both into the
+    same output line/cycle. This models architecture A: the output bus, history
+    URAM and wrapper are unchanged (one 16-byte line and one long-term write per
+    cycle); the speedup comes from retiring two short commands per cycle where
+    single-issue is command-bound.
+
+    A pair (cm0, cm1) is co-issued ("folded") only when it stays within the
+    contained datapath's resources:
+      - At most one output line completes this cycle (so the 1-line/cycle output
+        and the single output holding register suffice). Equivalently cm0 and
+        cm1 do not *both* cross a 16-byte line boundary.
+      - cm1 needs no long-term (URAM) read (lt_val=0): only cm0 drives the
+        single long-term read port; a far copy in cm1 defers it to its own cycle.
+    Otherwise cm1 is deferred to the next cycle and issued on its own (exactly
+    as single-issue would), so correctness is independent of folding.
+
+    The crux when folding is the same-cycle RAW hazard: cm1's copy may read bytes
+    cm0 produces in the *same* cycle. Because consecutive commands are contiguous
+    in decompressed-output space, cm1's copy can only read positions below its
+    own start; the positions in [P0, P1) are exactly cm0's output this cycle,
+    forwardable from cm0's combinational result; positions below P0 are committed
+    history. So a folded cm1 copy is always satisfiable.
+
+    The decompressed output is identical to the single-issue datapath (command
+    values are pairing-independent). When `counters` (a dict) is supplied:
+      - 'single': single-issue command cycles (== command count),
+      - 'cycles': contained dual-issue issue cycles,
+      - 'pairs' : cycles that folded two commands,
+      - 'blocked': adjacent pairs not folded (line-cross or cm1 long-term read),
+      - 'fwd'/'fwd_max': forwarding activity.
+
+    A single absolute buffer per chunk captures the data flow (history split
+    across SRL/URAM in hardware is functionally just decompressed history) and
+    exercises the forwarding exactly; copy bytes are produced sequentially, so
+    run-length, self-overlapping and forwarded reads all read freshly produced
+    bytes, matching the hardware."""
+
+    commands = list(commands)
+
+    single = 0
+    cycles = 0
+    pairs = 0
+    blocked = 0     # adjacent pairs the contained fold rule could not co-issue
+    fwd = 0         # paired cycles where cm1 forwarded a byte from cm0
+    fwd_max = 0     # deepest forward (max bytes cm1 read from cm0's output)
+
+    buf = bytearray()
+
+    def run(cm, p_commit=None):
+        # Append one command's output bytes to the chunk buffer. p_commit, if
+        # given, is the absolute index at/after which bytes are produced by an
+        # earlier command in the *same* cycle (must be forwarded in hardware
+        # rather than read from committed history). Returns the number of bytes
+        # this command read from the forward window.
+        nonlocal fwd_max
+        p = len(buf)
+        cp_count = cm.cp_end - cm.py_start
+        nfwd = 0
+        for k in range(cp_count):
+            src = p + k - cm.py_cp_off
+            assert 0 <= src < len(buf), 'copy source out of range'
+            if p_commit is not None and src >= p_commit:
+                nfwd += 1
+            buf.append(buf[src])
+        buf.extend(cm.py_li)
+        if nfwd > fwd_max:
+            fwd_max = nfwd
+        return nfwd
+
+    i = 0
+    n = len(commands)
+    while i < n:
+        cm0 = commands[i]
+        single += 1
+        cycles += 1
+        p0 = len(buf)
+        run(cm0)
+        last = cm0.last
+        i += 1
+
+        # Try to fold the next command into this cycle. The contained datapath
+        # can co-issue it only when at most one line completes this cycle and cm1
+        # needs no long-term read.
+        if not last and i < n:
+            cm1 = commands[i]
+            p1 = len(buf)                                 # = p0 + B0
+            b0 = p1 - p0
+            b1 = (cm1.cp_end - cm1.py_start) + len(cm1.py_li)
+            # Contained-fold gate. The pair must produce no more than one line of
+            # output (<= WI bytes total). With a starting fill < WI this means a
+            # span of <= WI consecutive positions, so at most one line completes
+            # this cycle and each short-term SRL lane is written at most once --
+            # exactly the single-issue datapath invariants. The fold is then one
+            # 4-region super-command (cp0, li0, cp1, li1) in a single 2*WI window;
+            # cm1's window positions sit WI higher than cmd_gen's value when cm0
+            # crosses the line boundary. Its only new mechanism is a combinational
+            # assembly array that forwards cm0's same-cycle bytes to cm1's copy.
+            # cm1 may also read long-term: the datapath mirrors the history URAM
+            # into a second read bank dedicated to cm1, so cm0 and cm1 have
+            # independent long-term read ports.
+            foldable = (b0 + b1 <= WI)
+            if foldable:
+                # Bytes at/after p0 were produced by cm0 this cycle: forward.
+                single += 1
+                pairs += 1
+                if run(cm1, p0) > 0:
+                    fwd += 1
+                last = cm1.last
+                i += 1
+            else:
+                blocked += 1
+
+        if last:
+            # Flush the chunk: emit it as WI-byte lines, last marked, cnt set.
+            total = len(buf)
+            off = 0
+            if total == 0:
+                yield DecompressedStream((0,)*WI, True, 0)
+            while off < total:
+                cnt = min(WI, total - off)
+                is_last = off + cnt >= total
+                line = tuple(buf[off:off+cnt]) + (0,)*(WI-cnt)
+                yield DecompressedStream(line, is_last, cnt if is_last else WI)
+                off += WI
+            buf = bytearray()
+
+            # The hardware burns one extra cycle per chunk to flush its output
+            # holding register; count it so the throughput estimate is honest.
+            cycles += 1
+
+    if counters is not None:
+        counters['single'] = single
+        counters['cycles'] = cycles
+        counters['pairs'] = pairs
+        counters['blocked'] = blocked
+        counters['fwd'] = fwd
+        counters['fwd_max'] = fwd_max
+
+
+def datapath_fold(commands, counters=None):
+    """SRL-faithful contained-fold datapath reference (architecture A).
+
+    This is `datapath` (the exact short-term-SRL + holding-register model that
+    generates de.tv) doubled: per cycle it processes command 0 and, when the
+    contained-fold gate allows, command 1 -- sharing the SAME short-term SRL and
+    output holding register. Because the model's SRL push is immediate, running
+    command 0's full step (including its SRL pushes) before command 1's step
+    makes command 1 read command 0's just-produced bytes automatically and
+    bit-exactly -- this is precisely the same-cycle forward the synthesizable
+    datapath must implement explicitly (clocked SRL => a mux that substitutes
+    command 0's output for the not-yet-committed SRL entry). So this function is
+    the bit-exact reference the fold RTL mirrors.
+
+    Fold gate (tight): co-issue command 1 only when the pair produces <= WI bytes
+    (one line, so <=1 completed line and <=1 SRL push per lane this cycle) and
+    command 1 needs no long-term read. Otherwise command 1 is processed on its
+    own next cycle.
+
+    The decompressed output is byte-identical to `datapath`; only the cycle count
+    differs. `counters` records single/cycles/pairs/blocked as in datapath_dual."""
+
+    # Shared datapath state (identical layout to `datapath`).
+    st = [SRL(32) for _ in range(WI)]
+    lt = [(0,)*WI] * 2**(16-WB)
+    wr_ptr = 0
+    oh_valid = [False] * WI
+    oh_data = [0] * WI
+
+    # Forward-overlay cross-check accounting (see process()/the fold loop).
+    chk_reads = 0
+    chk_fwd = 0
+
+    def process(cm, overlay=None, pushes=None):
+        """One command's datapath step (mirrors the body of `datapath`). Mutates
+        the shared st/lt/wr_ptr/oh_* state and yields output transfers.
+
+        `pushes`, if a dict, records this command's per-lane short-term pushes
+        (lane -> pushed byte). `overlay`, if (snap_data, snap_ptr, prev), is the
+        pre-fold (clocked) SRL snapshot plus command 0's recorded pushes; when
+        given (command 1 of a fold), every short-term read is validated against
+        the explicit RTL forward overlay over the *un-pushed* bank, proving the
+        synthesizable mux: read bank at (index - pushed_lane), but substitute
+        command 0's just-written byte when the post-push index resolves to 0."""
+        nonlocal wr_ptr, chk_reads, chk_fwd
+
+        cp_sel = [0] * WI
+        cp_data = [0] * WI
+        li_la = [0] * WI
+        st_la = [0] * WI
+        rol_sel = [0] * WI
+        mux_sel = [0] * WI
+        mux_data = [0] * WI
+
+        # Decode the mux control signals.
+        for byte in range(WI):
+            if byte < cm.cp_end - WI:
+                mux = 1
+            elif byte < cm.li_end - WI:
+                mux = 0
+            elif byte < cm.cp_end:
+                mux = 1
+            else:
+                mux = 0
+
+            if cm.cp_rle:
+                cp_rol = (cm.cp_rol - byte) & (WI*2-1)
+            else:
+                cp_rol = cm.cp_rol
+            rol = cp_rol if mux else cm.li_rol
+
+            prec = max(0, cm.li_end - WI)
+            cpl = ((byte - cm.cp_rol - prec) & (WI*2-1)) >= WI
+            lil = ((byte - cm.li_rol - prec) & (WI*2-1)) >= WI
+            if cm.cp_rle:
+                cpl = False
+
+            cps = 2 * bool(cm.lt_val)
+            cps += bool(cpl ^ cm.lt_swap)
+
+            cp_sel[byte] = cps
+            rol_sel[byte] = rol
+            mux_sel[byte] = mux
+            li_la[byte] = lil
+            st_la[byte] = cpl
+
+        # Load the data sources available to the datapath.
+        li_data = tuple((cm.py_data[byte + WI*li_la[byte]] for byte in range(WI)))
+
+        # Short-term read. The address is the same as `datapath`; when an overlay
+        # is supplied we additionally compute the value the synthesizable datapath
+        # would (reading the clocked, un-pushed SRL bank + a forward mux) and
+        # assert it equals the real post-command-0 read.
+        st_data = [0] * WI
+        for byte in range(WI):
+            idx = cm.st_addr - st_la[byte] + oh_valid[byte]
+            val = st[byte][idx]
+            # The forward overlay only governs short-term reads; a long-term cm1
+            # reads committed history (le/lo) and bypasses the SRL, so its unused
+            # short-term read is not cross-checked.
+            if overlay is not None and not cm.lt_val:
+                snap_data, snap_ptr, prev = overlay
+                pushed = byte in prev
+                if pushed and idx % 32 == 0:
+                    ov = prev[byte]
+                    chk_fwd += 1
+                else:
+                    k = idx - (1 if pushed else 0)
+                    ov = snap_data[byte][(snap_ptr[byte] + k) % 32]
+                assert ov == val, (
+                    'forward-overlay mismatch at lane %d: overlay=%r real=%r'
+                    % (byte, ov, val))
+                chk_reads += 1
+            st_data[byte] = val
+        st_data = tuple(st_data)
+
+        le_data = lt[(cm.lt_adev * 2) & (2**(16-WB)-1)]
+        lo_data = lt[(cm.lt_adod * 2 + 1) & (2**(16-WB)-1)]
+
+        for byte in range(WI):
+            if cp_sel[byte] == 2:
+                cp_data[byte] = le_data[byte]
+            elif cp_sel[byte] == 3:
+                cp_data[byte] = lo_data[byte]
+            else:
+                cp_data[byte] = st_data[byte]
+
+        for byte in range(WI):
+            src_data = cp_data if mux_sel[byte] else li_data
+            mux_data[byte] = src_data[(rol_sel[byte] + byte) & (WI-1)]
+
+        # Update the holding register and short-term memory (current line).
+        for byte in range(WI):
+            if not oh_valid[byte] and byte < cm.li_end:
+                oh_data[byte] = mux_data[byte]
+                oh_valid[byte] = True
+                if pushes is not None:
+                    pushes[byte] = mux_data[byte]
+                st[byte].push(mux_data[byte])
+
+        # Handle finished lines.
+        if cm.li_end >= WI or cm.last:
+            data = tuple(oh_data)
+            if cm.li_end:
+                lt[wr_ptr] = data
+                wr_ptr += 1
+                wr_ptr &= 2**(16-WB)-1
+            if cm.last:
+                yield DecompressedStream(data, cm.li_end <= WI, min(WI, cm.li_end))
+            else:
+                yield DecompressedStream(data, False, WI)
+            for byte in range(WI):
+                oh_valid[byte] = False
+
+            if cm.last:
+                wr_ptr = 0
+
+        # Update the holding register and short-term memory for the next cycle.
+        for byte in range(WI-1):
+            if (byte + WI) < cm.li_end:
+                oh_data[byte] = mux_data[byte]
+                oh_valid[byte] = True
+                if pushes is not None:
+                    pushes[byte] = mux_data[byte]
+                st[byte].push(mux_data[byte])
+
+        if cm.last and cm.li_end > WI:
+            yield DecompressedStream(tuple(oh_data), True, cm.li_end - WI)
+            for byte in range(WI):
+                oh_valid[byte] = False
+
+    commands = list(commands)
+    single = 0
+    cycles = 0
+    pairs = 0
+    blocked = 0
+    i = 0
+    n = len(commands)
+    while i < n:
+        cm0 = commands[i]
+        single += 1
+        cycles += 1
+        # Snapshot the clocked SRL before command 0 pushes, and record command
+        # 0's per-lane pushes, so a folded command 1 can be validated against the
+        # explicit RTL forward overlay (rather than the model's immediate push).
+        snap_data = [list(st[b]._data) for b in range(WI)]
+        snap_ptr = [st[b]._ptr for b in range(WI)]
+        cm0_pushes = {}
+        for t in process(cm0, pushes=cm0_pushes):
+            yield t
+        last = cm0.last
+        i += 1
+
+        if not last and i < n:
+            cm1 = commands[i]
+            b0 = (cm0.cp_end - cm0.py_start) + len(cm0.py_li)
+            b1 = (cm1.cp_end - cm1.py_start) + len(cm1.py_li)
+            if (b0 + b1 <= WI):
+                single += 1
+                pairs += 1
+                # Same cycle, shared st/oh: cm1 reads cm0's just-pushed bytes,
+                # cross-checked against the explicit forward overlay (short-term
+                # cm1); a long-term cm1 instead reads the mirrored history URAM.
+                for t in process(cm1, overlay=(snap_data, snap_ptr, cm0_pushes)):
+                    yield t
+                i += 1
+            else:
+                blocked += 1
+
+    if counters is not None:
+        counters['single'] = single
+        counters['cycles'] = cycles
+        counters['pairs'] = pairs
+        counters['blocked'] = blocked
+        counters['chk_reads'] = chk_reads
+        counters['chk_fwd'] = chk_fwd
+
+
 def verifier(data_stream, expected):
     """Verifies the given decompressed output stream against the given list
     of expected data chunks. Chunks should be represented as bytes objects."""
@@ -639,6 +1004,16 @@ def writer(stream, fname):
     with open(fname, 'w') as fil:
         for transfer in stream:
             print(transfer.serialize(), file=fil)
+            yield transfer
+
+
+def writer_exec(stream, fname):
+    """Like writer, but serializes the semantic execute command (including the
+    literal bytes) for the dual-issue execute testbench. Passes each transfer
+    through unchanged so it can be teed into the command stream."""
+    with open(fname, 'w') as fil:
+        for transfer in stream:
+            print(transfer.serialize_exec(), file=fil)
             yield transfer
 
 

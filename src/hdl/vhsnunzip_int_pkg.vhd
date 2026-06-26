@@ -221,6 +221,40 @@ package vhsnunzip_int_pkg is
     );
   end component;
 
+  -- Output of the speculative dual-issue decoder: up to two element_stream
+  -- transfers per cycle. el0.valid marks the transfer (slot 0 always present
+  -- when valid); el1.valid marks a second element decoded in the same cycle.
+  -- Flattening the stream (el0, then el1 where valid) yields exactly the same
+  -- element sequence as the single-issue decoder.
+  type dual_element_stream is record
+    el0 : element_stream;
+    el1 : element_stream;
+  end record;
+
+  constant DUAL_ELEMENT_STREAM_INIT : dual_element_stream := (
+    el0 => ELEMENT_STREAM_INIT,
+    el1 => ELEMENT_STREAM_INIT
+  );
+
+  -- Speculative dual-issue Snappy element decoder. Decodes element N at the
+  -- current offset and, in parallel, element N+1 at every candidate end offset
+  -- of N; it emits both when N does not cross the line boundary and N's size is
+  -- among the SPEC_OFFSETS speculated offsets (otherwise just N). See
+  -- C_SPEC_OFFSETS in vhsnunzip_utils_pkg.
+  component vhsnunzip_decoder_dual is
+    generic (
+      SPEC_OFFSETS : natural := C_SPEC_OFFSETS
+    );
+    port (
+      clk         : in  std_logic;
+      reset       : in  std_logic;
+      cd          : in  compressed_stream_double;
+      cd_ready    : out std_logic;
+      el          : out dual_element_stream;
+      el_ready    : in  std_logic
+    );
+  end component;
+
   -- Intermediate command stream between the two command generator stages.
   type partial_command_stream is record
 
@@ -286,6 +320,38 @@ package vhsnunzip_int_pkg is
       c1_ready    : in  std_logic
     );
   end component;
+
+  -- Two partial commands co-issued in one cycle. c1_0 is always present when the
+  -- transfer is valid; c1_1 is present when a second partial command is produced
+  -- the same cycle (only for single-chunk copies, per the conservative pairing).
+  type dual_partial_command_stream is record
+    c1_0 : partial_command_stream;
+    c1_1 : partial_command_stream;
+  end record;
+
+  constant DUAL_PARTIAL_COMMAND_STREAM_INIT : dual_partial_command_stream := (
+    c1_0 => PARTIAL_COMMAND_STREAM_INIT,
+    c1_1 => PARTIAL_COMMAND_STREAM_INIT
+  );
+
+  -- Speculative dual-issue command generator stage 1. Splits copies into
+  -- <=C_BYTES chunks like vhsnunzip_cmd_gen_1, but co-issues a second partial
+  -- command when the lead element finishes its (single) chunk this cycle and the
+  -- next element is also a single-chunk copy. Flattening (c1_0 then c1_1) yields
+  -- the same partial-command sequence as the single-issue stage.
+  component vhsnunzip_cmd_gen_1_dual is
+    port (
+      clk         : in  std_logic;
+      reset       : in  std_logic;
+      el          : in  dual_element_stream;
+      el_ready    : out std_logic;
+      c1          : out dual_partial_command_stream;
+      c1_ready    : in  std_logic
+    );
+  end component;
+
+  -- Forward declaration note: dual_command_stream and the dual stage-2 component
+  -- are declared just after command_stream below.
 
   -- Command stream for the datapath.
   type command_stream is record
@@ -413,6 +479,42 @@ package vhsnunzip_int_pkg is
     );
   end component;
 
+  -- Two datapath commands co-issued in one cycle. cm0 is always present when the
+  -- transfer is valid; cm1 is present when a second command retires the same
+  -- cycle (only for single-command partial commands, per the conservative
+  -- pairing).
+  type dual_command_stream is record
+    cm0 : command_stream;
+    cm1 : command_stream;
+  end record;
+
+  constant DUAL_COMMAND_STREAM_INIT : dual_command_stream := (
+    cm0 => COMMAND_STREAM_INIT,
+    cm1 => COMMAND_STREAM_INIT
+  );
+
+  -- Speculative dual-issue command generator stage 2. Slot 0 is the single-issue
+  -- address generator (vhsnunzip_cmd_gen_2), which splits long literals over
+  -- multiple cycles. Slot 1 generates a second command in the same cycle, from
+  -- slot 0's advanced offset/line-pointer state, whenever the lead partial
+  -- command retires in one command and the next one also does. Flattening (cm0
+  -- then cm1) yields the same command sequence as the single-issue stage.
+  component vhsnunzip_cmd_gen_2_dual is
+    generic (
+      LONG_CHUNKS : boolean := true
+    );
+    port (
+      clk         : in  std_logic;
+      reset       : in  std_logic;
+      c1          : in  dual_partial_command_stream;
+      c1_ready    : out std_logic;
+      lt_off_ld   : in  std_logic := '1';
+      lt_off      : in  unsigned(C_AW downto 0) := (others => '0');
+      cm          : out dual_command_stream;
+      cm_ready    : in  std_logic
+    );
+  end component;
+
   -- Decompression output stream payload.
   type decompressed_stream is record
 
@@ -440,6 +542,62 @@ package vhsnunzip_int_pkg is
   );
 
   procedure stream_des(l: inout line; value: inout decompressed_stream; to_x: boolean);
+
+  -- Semantic command for the behavioral dual-issue execute model. This carries
+  -- the decompression operation directly (copy byte count + offset, literal byte
+  -- count + the literal bytes themselves) rather than the address-level
+  -- command_stream fields. The literal bytes stand in for the literal-data FIFO
+  -- (which the Python reference model likewise does not model); these fields do
+  -- not exist in synthesizable hardware. Used only to verify the dual-issue
+  -- retirement + same-cycle copy-forwarding logic against de.tv.
+  type exec_command is record
+    valid    : std_logic;
+    cp_count : unsigned(C_CNT-1 downto 0);
+    cp_off   : unsigned(15 downto 0);
+    li_count : unsigned(C_CNT-1 downto 0);
+    li       : byte_array(0 to C_BYTES-1);
+    last     : std_logic;
+  end record;
+
+  constant EXEC_COMMAND_INIT : exec_command := (
+    valid    => '0',
+    cp_count => (others => UNDEF),
+    cp_off   => (others => UNDEF),
+    li_count => (others => UNDEF),
+    li       => (others => (others => UNDEF)),
+    last     => UNDEF
+  );
+
+  procedure stream_des(l: inout line; value: inout exec_command; to_x: boolean);
+
+  -- Two semantic commands co-issued in one cycle. c0 is always present when the
+  -- transfer is valid; c1 is present when a second command retires the same
+  -- cycle.
+  type dual_exec_command is record
+    c0 : exec_command;
+    c1 : exec_command;
+  end record;
+
+  constant DUAL_EXEC_COMMAND_INIT : dual_exec_command := (
+    c0 => EXEC_COMMAND_INIT,
+    c1 => EXEC_COMMAND_INIT
+  );
+
+  -- Behavioral dual-issue execute. Retires up to two semantic commands per
+  -- cycle into decompressed output, forwarding command 0's same-cycle output to
+  -- command 1's copy reads (the RAW hazard). Functional reference for the
+  -- dual-issue datapath; not synthesizable (it uses an absolute per-chunk
+  -- history buffer in place of the short-term SRL + long-term URAM split).
+  component vhsnunzip_execute_dual is
+    port (
+      clk         : in  std_logic;
+      reset       : in  std_logic;
+      cm          : in  dual_exec_command;
+      cm_ready    : out std_logic;
+      de          : out decompressed_stream;
+      de_ready    : in  std_logic
+    );
+  end component;
 
   -- Snappy decompression pipeline.
   component vhsnunzip_pipeline is
@@ -469,6 +627,47 @@ package vhsnunzip_int_pkg is
       dbg_cm      : out command_stream;
       dbg_s1      : out command_stream;
       -- pragma translate_on
+      de          : out decompressed_stream;
+      de_ready    : in  std_logic;
+      de_level    : out unsigned(5 downto 0)
+    );
+  end component;
+
+  -- Speculative dual-issue Snappy decompression pipeline. Same ports as
+  -- vhsnunzip_pipeline (minus the sim-only debug taps): vhsnunzip_unbuffered
+  -- instantiates it when SPEC_OFFSETS > 0. Internally it runs the
+  -- dual decoder + dual command generators and a contained-fold datapath that
+  -- retires up to two commands per cycle into the same one-line output bus and
+  -- single long-term read/write port.
+  component vhsnunzip_pipeline_dual is
+    generic (
+      LONG_CHUNKS : boolean := true;
+      SPEC_OFFSETS : natural := C_SPEC_OFFSETS
+    );
+    port (
+      clk         : in  std_logic;
+      reset       : in  std_logic;
+      co          : in  compressed_stream_single;
+      co_ready    : out std_logic;
+      co_level    : out unsigned(5 downto 0);
+      lt_off_ld   : in  std_logic := '1';
+      lt_off      : in  unsigned(C_AW downto 0) := (others => '0');
+      lt_rd_valid : out std_logic;
+      lt_rd_ready : in  std_logic := '1';
+      lt_rd_adev  : out unsigned(C_AW-1 downto 0);
+      lt_rd_adod  : out unsigned(C_AW-1 downto 0);
+      lt_rd_next  : in  std_logic;
+      lt_rd_even  : in  byte_array(0 to C_BYTES-1);
+      lt_rd_odd   : in  byte_array(0 to C_BYTES-1);
+      -- Second long-term read port, dedicated to cm1 (the co-issued command).
+      -- Backed by a mirror of the history URAM; see vhsnunzip_unbuffered.
+      lt_rd_valid1 : out std_logic;
+      lt_rd_ready1 : in  std_logic := '1';
+      lt_rd_adev1  : out unsigned(C_AW-1 downto 0);
+      lt_rd_adod1  : out unsigned(C_AW-1 downto 0);
+      lt_rd_next1  : in  std_logic := '0';
+      lt_rd_even1  : in  byte_array(0 to C_BYTES-1) := (others => (others => '0'));
+      lt_rd_odd1   : in  byte_array(0 to C_BYTES-1) := (others => (others => '0'));
       de          : out decompressed_stream;
       de_ready    : in  std_logic;
       de_level    : out unsigned(5 downto 0)
@@ -841,6 +1040,27 @@ package body vhsnunzip_int_pkg is
     if to_x then
       value.last := vhsn_to_x01(value.last);
       value.cnt := vhsn_to_x01(value.cnt);
+    end if;
+    value.valid := '1';
+  end procedure;
+
+  procedure stream_des(l: inout line; value: inout exec_command; to_x: boolean) is
+  begin
+    vhsn_read(l, value.cp_count);
+    vhsn_read(l, value.cp_off);
+    vhsn_read(l, value.li_count);
+    for i in value.li'range loop
+      vhsn_read(l, value.li(i));
+      if to_x then
+        value.li(i) := vhsn_to_x01(value.li(i));
+      end if;
+    end loop;
+    vhsn_read(l, value.last);
+    if to_x then
+      value.cp_count := vhsn_to_x01(value.cp_count);
+      value.cp_off := vhsn_to_x01(value.cp_off);
+      value.li_count := vhsn_to_x01(value.li_count);
+      value.last := vhsn_to_x01(value.last);
     end if;
     value.valid := '1';
   end procedure;

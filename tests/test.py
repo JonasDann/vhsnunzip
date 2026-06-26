@@ -55,16 +55,40 @@ cd = Counter(writer(pre_decoder(cs), '../vhdl/cd.tv'))
 el = Counter(writer(decoder(cd), '../vhdl/el.tv'))
 c1 = Counter(writer(cmd_gen_1(el), '../vhdl/c1.tv'))
 cm = Counter(writer(cmd_gen_2(c1), '../vhdl/cm.tv'))
-de = Counter(writer(datapath(cm), '../vhdl/de.tv'))
+cme = writer_exec(cm, '../vhdl/cmde.tv')
+de = Counter(writer(datapath(cme), '../vhdl/de.tv'))
 drain(verifier(de, uncompressed))
+
+# Verify the speculative dual-issue datapath model against the same data, and
+# measure the throughput gain over single-issue. This rebuilds the command
+# stream (the single-issue generators above were consumed) and runs the
+# dual-issue execution model, which co-issues up to two commands per cycle.
+print('Simulating dual-issue decompression in Python...')
+dual_counters = {}
+drain(verifier(datapath_dual(
+    cmd_gen_2(cmd_gen_1(decoder(pre_decoder(data_source(compressed))))),
+    dual_counters), uncompressed))
+
+# Verify the SRL-faithful contained-fold model (the bit-exact reference the fold
+# datapath RTL mirrors): same short-term-SRL + holding-register scheme as the
+# single-issue datapath, doubled, with the same-cycle forward falling out of the
+# shared immediate-push SRL.
+fold_counters = {}
+drain(verifier(datapath_fold(
+    cmd_gen_2(cmd_gen_1(decoder(pre_decoder(data_source(compressed))))),
+    fold_counters), uncompressed))
 
 # Run vhdeps if requested.
 if vhdeps_target is not None:
     print('Checking that VHDL and Python streams match...')
     test_cases = [
         'vhsnunzip_pre_decoder_tc', 'vhsnunzip_decoder_long_tc',
-        'vhsnunzip_cmd_gen_1_tc', 'vhsnunzip_cmd_gen_2_tc',
-        'vhsnunzip_pipeline_tc', 'vhsnunzip_unbuffered_tc',
+        'vhsnunzip_decoder_dual_tc', 'vhsnunzip_execute_dual_tc',
+        'vhsnunzip_cmd_gen_1_tc', 'vhsnunzip_cmd_gen_1_dual_tc',
+        'vhsnunzip_cmd_gen_2_tc', 'vhsnunzip_cmd_gen_2_dual_tc',
+        'vhsnunzip_cmd_gen_dual_tc',
+        'vhsnunzip_pipeline_tc', 'vhsnunzip_pipeline_dual_tc',
+        'vhsnunzip_unbuffered_tc', 'vhsnunzip_unbuffered_dual_tc',
     ]
     # The buffered and multicore cores have hardcoded 8-byte-line geometry, so
     # they only build/simulate at the default datapath width (WI == 8). The
@@ -90,6 +114,23 @@ print('  Stream transfer counts: cs=%d, cd=%d, el=%d, c1=%d, cm=%d, de=%d' % (
     cs.count, cd.count, el.count, c1.count, cm.count, de.count))
 print('  Approx. bytes/cycle: %.3f' % (
     len(data) / cm.count))
+if dual_counters.get('cycles'):
+    print('  Dual-issue (contained fold): single=%d cycles, dual=%d cycles, %d folded (%.1f%%), %d blocked' % (
+        dual_counters['single'], dual_counters['cycles'], dual_counters['pairs'],
+        100.0 * dual_counters['pairs'] / max(1, dual_counters['single']),
+        dual_counters['blocked']))
+    print('  Dual-issue forwarding: %d/%d folds hit the RAW hazard, max %d bytes forwarded' % (
+        dual_counters['fwd'], dual_counters['pairs'], dual_counters['fwd_max']))
+    print('  Dual-issue bytes/cycle: %.3f (%.2fx single-issue)' % (
+        len(data) / dual_counters['cycles'],
+        dual_counters['single'] / dual_counters['cycles']))
+if fold_counters.get('cycles'):
+    print('  SRL-fold (RTL reference): single=%d, dual=%d cycles, %d folded -> %.3f B/cyc (%.2fx)' % (
+        fold_counters['single'], fold_counters['cycles'], fold_counters['pairs'],
+        len(data) / fold_counters['cycles'],
+        fold_counters['single'] / fold_counters['cycles']))
+    print('  SRL-fold forward overlay: %d cm1 short-term reads cross-checked, %d via forward mux' % (
+        fold_counters.get('chk_reads', 0), fold_counters.get('chk_fwd', 0)))
 
 print()
 print('All good!')

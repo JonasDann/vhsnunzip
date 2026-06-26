@@ -1,0 +1,436 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+library work;
+use work.vhsnunzip_utils_pkg.all;
+use work.vhsnunzip_int_pkg.all;
+
+-- Speculative dual-issue Snappy element decoder.
+--
+-- This decodes two elements per cycle. It mirrors the single-issue decoder
+-- (vhsnunzip_decoder, the <=64kiB variant): element 0 is decoded at the current
+-- offset, and a second element is emitted when element 0 does not cross the line
+-- boundary (so element 1's header is inside the current two-line window).
+--
+-- The naive way to find element 1 is to decode it at element 0's *end* offset,
+-- i.e. chain a second decode onto the combinational output of the first. That
+-- chain, together with the data-byte mux that selects the header bytes at the
+-- loop-carried offset `off`, is the timing bottleneck: the byte select + header
+-- decode + end-offset arithmetic all sit inside the single-cycle offset
+-- recurrence.
+--
+-- We take both off the recurrence by pre-decoding the *whole line* one stage
+-- early. Every element starts at a line-local offset 0 .. C_BYTES-1, so we run
+-- C_BYTES copies of the per-element decode -- one per possible start offset, each
+-- reading a *fixed* set of header bytes (no off-driven byte mux) -- and register
+-- the resulting `decoded_t` array. Because a decode at offset j only ever
+-- indexes data modulo the line width, decoding at offset j is exactly the result
+-- a chained decode starting at j would produce. Element 0 is then simply
+-- `dec(off)` and element 1 is `dec(off0)` (off0 = element 0's end offset): the
+-- recurrence degenerates to two cascaded record muxes over the registered array
+-- plus the narrow `off` arithmetic, with no header decode in the loop at all.
+--
+-- Pipeline (all three are 1-deep elastic, so steady-state throughput is one
+-- transfer (up to two elements) per cycle; only latency grows):
+--
+--   Decode-all stage (cd -> cdd): registers the incoming double line together
+--   with its full per-offset decode `cdd_dec`. The C_BYTES parallel header
+--   decoders live here, between two registers (cd .. cdd_dec), off the
+--   recurrence. The line is pre-fetched/decoded while it waits, so the holding
+--   register below refills from an *already decoded* line with no bubble.
+--
+--   Stage 1 (recurrence): loads the holding register `cdh`/`cdh_dec` from the
+--   decode-all stage, then advances the loop-carried offset `off` and selects
+--   element 0 = cdh_dec(off) and element 1 = cdh_dec(off0). Only the (registered)
+--   array is read here, so the loop carries no decode logic.
+--
+--   Stage 2 (format): builds the dual_element_stream output from the stage-1
+--   register `s1`, which now carries the two selected decodes directly.
+--
+-- SPEC_OFFSETS bounds element 0's size for which element 1 is co-issued: when
+-- element 0 is larger than SPEC_OFFSETS+1 bytes we emit element 0 alone and pick
+-- element 1 up as next cycle's element 0 -- always correct, just not dual-issued
+-- that cycle. SPEC_OFFSETS = C_BYTES-2 covers every reachable element-0 size
+-- (then behaviourally identical to the single-issue decoder's element sequence);
+-- SPEC_OFFSETS = 0 disables co-issue entirely. The standalone testbench checks
+-- the flattened (el0, then el1 when present) stream against the single-issue
+-- el.tv, which holds for any SPEC_OFFSETS.
+entity vhsnunzip_decoder_dual is
+  generic (
+
+    -- Maximum element-0 size (in bytes, minus one) for which element 1 is
+    -- co-issued. 0 disables dual-issue (single element per cycle). See
+    -- C_SPEC_OFFSETS in vhsnunzip_utils_pkg.
+    SPEC_OFFSETS : natural := C_SPEC_OFFSETS
+
+  );
+  port (
+    clk         : in  std_logic;
+    reset       : in  std_logic;
+
+    -- Double line compressed data stream input.
+    cd          : in  compressed_stream_double;
+    cd_ready    : out std_logic;
+
+    -- Dual element information stream output.
+    el          : out dual_element_stream;
+    el_ready    : in  std_logic
+  );
+end vhsnunzip_decoder_dual;
+
+architecture behavior of vhsnunzip_decoder_dual is
+
+  -- Result of decoding one element at a given offset.
+  type decoded_t is record
+    cp_val   : std_logic;
+    cp_off   : unsigned(15 downto 0);
+    cp_len   : unsigned(5 downto 0);
+    li_val   : std_logic;
+    li_off   : unsigned(C_WIN-1 downto 0);
+    li_len   : unsigned(31 downto 0);
+    off_next : unsigned(16 downto 0);
+  end record;
+
+  constant DECODED_INIT : decoded_t := (
+    cp_val   => '0',
+    cp_off   => (others => '0'),
+    cp_len   => (others => '0'),
+    li_val   => '0',
+    li_off   => (others => '0'),
+    li_len   => (others => '0'),
+    off_next => (others => '0')
+  );
+
+  type decoded_array is array (natural range <>) of decoded_t;
+
+  -- Smallest possible element size in bytes (a 2-byte copy, or a 1-byte literal
+  -- header plus a single data byte). Element 1 therefore starts at least this
+  -- many bytes past element 0, so element-0 sizes below this never occur.
+  constant DELTA_MIN : natural := 2;
+
+  -- Stage-1 -> stage-2 pipeline register. Carries the two selected decodes and
+  -- the per-slot control bits; the element_stream formatting happens in stage 2.
+  type s1_reg_t is record
+    valid   : std_logic;                 -- stage produced a transfer
+    empty0  : std_logic;                 -- el0 is the empty literal-continuation
+    d0      : decoded_t;                  -- el0 decode (when empty0 = '0')
+    e0_pop  : std_logic;                 -- el0 ld_pop
+    e0_last : std_logic;                 -- el0 last
+    e1_val  : std_logic;                 -- el1 present
+    e1_pop  : std_logic;                 -- el1 ld_pop
+    e1_last : std_logic;                 -- el1 last
+    d1      : decoded_t;                  -- el1 decode (when e1_val = '1')
+  end record;
+
+  constant S1_REG_INIT : s1_reg_t := (
+    valid   => '0',
+    empty0  => '0',
+    d0      => DECODED_INIT,
+    e0_pop  => '0',
+    e0_last => '0',
+    e1_val  => '0',
+    e1_pop  => '0',
+    e1_last => '0',
+    d1      => DECODED_INIT
+  );
+
+  -- Decode a single element starting at byte offset `off` within the line
+  -- window `data`, given the last valid byte index `endi`. Assumes off <= endi
+  -- (the caller handles the literal-data continuation case where off > endi).
+  -- Returns the element header info and the offset just past this element's
+  -- data. This is the same logic as vhsnunzip_decoder's per-element decode.
+  function decode_one(
+    data : byte_array;
+    off  : unsigned;
+    endi : unsigned
+  ) return decoded_t is
+    variable r     : decoded_t;
+    variable ofi   : integer;
+    variable offns : unsigned(C_WIN-1 downto 0);
+  begin
+    r.cp_val := '0';
+    r.li_val := '0';
+    r.cp_off := (others => '0');
+    r.cp_len := (others => '0');
+    r.li_off := (others => '0');
+    r.li_len := (others => '0');
+
+    -- Copy element.
+    offns := resize(off(C_IDX-1 downto 0), C_WIN);
+    ofi := to_integer(off(C_IDX-1 downto 0));
+
+    case data(ofi)(1 downto 0) is
+      when "01" => r.cp_val := '1'; offns := offns + 2;
+      when "10" => r.cp_val := '1'; offns := offns + 3;
+      when "11" => r.cp_val := '1'; offns := offns + 5;
+      when others => r.cp_val := '0';
+    end case;
+
+    if data(ofi)(1) = '0' then
+      r.cp_off := "00000" & unsigned(data(ofi)(7 downto 5)) & unsigned(data(ofi + 1));
+      r.cp_len := resize(unsigned(data(ofi)(4 downto 2)), 6) + 3;
+    else
+      r.cp_off := unsigned(data(ofi + 2)) & unsigned(data(ofi + 1));
+      r.cp_len := unsigned(data(ofi)(7 downto 2));
+    end if;
+
+    -- Literal element.
+    ofi := to_integer(offns(C_IDX-1 downto 0));
+
+    if offns > endi then
+      r.li_val := '0';
+    elsif data(ofi)(1 downto 0) /= "00" then
+      r.li_val := '0';
+    elsif data(ofi)(7 downto 4) = "1111" then
+      r.li_val := '1';
+      offns := offns + 2 + unsigned(data(ofi)(3 downto 2));
+    else
+      r.li_val := '1';
+      offns := offns + 1;
+    end if;
+
+    r.li_off := offns;
+
+    if std_match(data(ofi), "111100--") then
+      r.li_len := X"000000" & unsigned(data(ofi + 1));
+    elsif std_match(data(ofi), "1111----") then
+      r.li_len := X"0000" & unsigned(data(ofi + 2)) & unsigned(data(ofi + 1));
+    else
+      r.li_len := X"000000" & "00" & unsigned(data(ofi)(7 downto 2));
+    end if;
+
+    -- Seek past literal data.
+    r.off_next := resize(offns, 17);
+    if r.li_val = '1' then
+      r.off_next := r.off_next + resize(r.li_len, 17) + 1;
+    end if;
+
+    return r;
+  end function;
+
+  -- Copy a decoded element's header fields into an element_stream record.
+  procedure apply(variable e : inout element_stream; constant d : in decoded_t) is
+  begin
+    e.cp_val := d.cp_val;
+    e.cp_off := d.cp_off;
+    e.cp_len := d.cp_len;
+    e.li_val := d.li_val;
+    e.li_off := d.li_off;
+    e.li_len := d.li_len;
+  end procedure;
+
+begin
+  proc: process (clk) is
+
+    -- Decode-all stage register (cd -> cdd): the incoming double line and its
+    -- full per-offset decode. The C_BYTES header decoders feed cdd_dec, which is
+    -- registered here so the recurrence in stage 1 never sees decode logic.
+    variable cdd     : compressed_stream_double := COMPRESSED_STREAM_DOUBLE_INIT;
+    variable cdd_dec : decoded_array(0 to C_BYTES-1) := (others => DECODED_INIT);
+
+    -- Decoder input holding register and its decode, copied wholesale from the
+    -- decode-all stage (pure register moves, no logic).
+    variable cdh     : compressed_stream_double := COMPRESSED_STREAM_DOUBLE_INIT;
+    variable cdh_dec : decoded_array(0 to C_BYTES-1) := (others => DECODED_INIT);
+
+    -- Offset of the next element with respect to cdh.data (loop-carried).
+    variable off    : unsigned(16 downto 0) := (others => '0');
+
+    -- Element 0 / element 1 selected decodes and element 0's end offset.
+    variable d0     : decoded_t;
+    variable d1     : decoded_t;
+    variable off0   : unsigned(16 downto 0);
+    variable esize  : unsigned(16 downto 0);
+    variable sidx   : integer;
+
+    -- Stage-1 -> stage-2 pipeline register.
+    variable s1     : s1_reg_t := S1_REG_INIT;
+
+    -- Stage-2 output holding register.
+    variable elo    : dual_element_stream := DUAL_ELEMENT_STREAM_INIT;
+
+    -- Flow-control: stage slot free for new data this cycle.
+    variable s2_free : boolean;
+    variable s1_free : boolean;
+
+    -- Snapshot of the decode-all stage occupancy at the start of the cycle. Both
+    -- the cdd->cdh drain and the cd->cdd refill are gated on this snapshot so
+    -- they never fire in the same evaluation; that keeps the registered cd_ready
+    -- (= not cdd.valid) handshake honest and guarantees cdh_dec is always copied
+    -- from an already-registered cdd_dec, never a same-cycle decode.
+    variable cdd_v0  : std_logic;
+
+  begin
+    if rising_edge(clk) then
+
+      -- Flow-control decisions from the entry state. A stage slot is free when
+      -- it is empty or its content moves downstream this cycle.
+      s2_free := (elo.el0.valid = '0') or (el_ready = '1');
+      s1_free := (s1.valid = '0') or s2_free;
+
+      cdd_v0 := cdd.valid;
+
+      -- ================= Stage 2: format output from s1 =================
+      -- Reads only the two registered decodes carried in s1.
+      if s2_free then
+        if s1.valid = '1' then
+
+          -- Element 0.
+          if s1.empty0 = '1' then
+            elo.el0 := ELEMENT_STREAM_INIT;
+            elo.el0.cp_val := '0';
+            elo.el0.li_val := '0';
+          else
+            apply(elo.el0, s1.d0);
+          end if;
+          elo.el0.ld_pop := s1.e0_pop;
+          elo.el0.last   := s1.e0_last;
+          elo.el0.valid  := '1';
+
+          -- Element 1.
+          if s1.e1_val = '1' then
+            apply(elo.el1, s1.d1);
+            elo.el1.ld_pop := s1.e1_pop;
+            elo.el1.last   := s1.e1_last;
+            elo.el1.valid  := '1';
+          else
+            elo.el1.valid  := '0';
+          end if;
+
+        else
+          elo.el0.valid := '0';
+          elo.el1.valid := '0';
+        end if;
+      end if;
+
+      -- ================= Holding register load (decode-all -> cdh) =========
+      -- Runs before stage 1 so a freshly loaded line is decoded the same cycle
+      -- (no bubble). The decode array comes pre-registered from the decode-all
+      -- stage, so this is a pure register move.
+      if cdh.valid = '0' and cdd_v0 = '1' then
+        cdh       := cdd;
+        cdh_dec   := cdd_dec;
+        cdd.valid := '0';                 -- free the decode-all stage to refill
+        if cdh.first = '1' then           -- cdh.valid is '1' here by construction
+          off := resize(cdh.start, 17);
+        end if;
+      end if;
+
+      -- ================= Stage 1: recurrence over the registered decode =====
+      if s1_free then
+
+        if cdh.valid = '1' then
+
+          if off > cdh.endi then
+
+            -- Literal-data continuation: the whole line is part of a previously
+            -- decoded literal. Emit an empty element that pops the line.
+            s1.valid  := '1';
+            s1.empty0 := '1';
+            s1.e0_pop := '1';
+            s1.e0_last := cdh.last;
+            s1.e1_val := '0';
+            off := off - C_BYTES;
+            cdh.valid := '0';
+
+          else
+
+            -- Element 0 is the registered decode at the current offset; its end
+            -- offset is element 1's start offset. No header decode happens here.
+            d0   := cdh_dec(to_integer(off(C_IDX-1 downto 0)));
+            off0 := d0.off_next;
+
+            s1.valid  := '1';
+            s1.empty0 := '0';
+            s1.d0     := d0;
+
+            if off0 > cdh.endi then
+
+              -- Element 0 crosses the line; emit only element 0 and pull a new
+              -- line. This is the single-issue case.
+              s1.e0_pop  := '1';
+              s1.e0_last := cdh.last;
+              s1.e1_val  := '0';
+              off := off0 - C_BYTES;
+              cdh.valid := '0';
+
+            else
+
+              -- Element 0 stays within the line, so element 1's header is in the
+              -- window. Element 1 is just the registered decode at off0, co-issued
+              -- when element 0 is small enough (size <= SPEC_OFFSETS+1).
+              s1.e0_pop  := '0';
+              s1.e0_last := '0';
+
+              esize := off0 - off;                  -- element 0 size (>= DELTA_MIN)
+              sidx  := to_integer(esize) - DELTA_MIN;
+
+              if sidx >= 0 and sidx < SPEC_OFFSETS then
+
+                d1 := cdh_dec(to_integer(off0(C_IDX-1 downto 0)));
+                s1.e1_val := '1';
+                s1.d1     := d1;
+
+                if d1.off_next > cdh.endi then
+                  s1.e1_pop  := '1';
+                  s1.e1_last := cdh.last;
+                  off := d1.off_next - C_BYTES;
+                  cdh.valid := '0';
+                else
+                  s1.e1_pop  := '0';
+                  s1.e1_last := '0';
+                  off := d1.off_next;
+                end if;
+
+              else
+
+                -- Element 0's size is outside the co-issue range: emit element 0
+                -- only and keep the line. Element 1 becomes next cycle's element
+                -- 0 (functionally identical, just not dual-issued this cycle).
+                s1.e1_val := '0';
+                off := off0;
+
+              end if;
+
+            end if;
+
+          end if;
+
+        else
+          s1.valid := '0';
+        end if;
+
+      end if;
+
+      -- ================= Decode-all stage (cd -> cdd) =====================
+      -- Pre-fetch and decode the next line while it waits. The C_BYTES parallel
+      -- header decoders sit between cd (registered upstream) and cdd_dec
+      -- (registered here); each decodes at a fixed start offset, so there is no
+      -- off-driven byte mux. Gated on the start-of-cycle snapshot so it refills
+      -- the cycle *after* the drain above empties it (when cd_ready has gone
+      -- high), never the same cycle.
+      if cdd_v0 = '0' then
+        cdd := cd;
+        for j in 0 to C_BYTES-1 loop
+          cdd_dec(j) := decode_one(cd.data, to_unsigned(j, off'length), cd.endi);
+        end loop;
+      end if;
+
+      -- Handle reset.
+      if reset = '1' then
+        cdd.valid := '0';
+        cdh.valid := '0';
+        s1.valid  := '0';
+        elo.el0.valid := '0';
+        elo.el1.valid := '0';
+        off := (others => '0');
+      end if;
+
+      -- Assign outputs.
+      cd_ready <= not cdd.valid;
+      el <= elo;
+
+    end if;
+  end process;
+end behavior;
