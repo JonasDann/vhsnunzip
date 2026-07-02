@@ -12,7 +12,7 @@ use work.vhsnunzip_pkg.all;
 use work.vhsnunzip_int_pkg.all;
 
 -- Wrapper-level test for the speculative dual-issue (fold) pipeline: the same
--- streaming toplevel as vhsnunzip_unbuffered_tc but with SPEC_OFFSETS > 0, so
+-- streaming toplevel as vhsnunzip_unbuffered_tc but with DUAL_ISSUE => true, so
 -- it drives the fold datapath through the real history RAM (rather than the
 -- pipeline_dual_tc's long-term read mock) and checks the decompressed output
 -- against the single-issue golden vectors (de.tv).
@@ -47,7 +47,7 @@ begin
 
   uut: vhsnunzip_unbuffered
     generic map (
-      SPEC_OFFSETS  => C_BYTES - 2,
+      DUAL_ISSUE   => true,
       RAM_STYLE     => RAM_STYLE
     )
     port map (

@@ -34,11 +34,15 @@ use work.vhsnunzip_int_pkg.all;
 -- Pipeline (all three are 1-deep elastic, so steady-state throughput is one
 -- transfer (up to two elements) per cycle; only latency grows):
 --
---   Decode-all stage (cd -> cdd): registers the incoming double line together
---   with its full per-offset decode `cdd_dec`. The C_BYTES parallel header
---   decoders live here, between two registers (cd .. cdd_dec), off the
---   recurrence. The line is pre-fetched/decoded while it waits, so the holding
---   register below refills from an *already decoded* line with no bubble.
+--   Decode-all stage (cd -> cdd): a depth-2 circular FIFO that registers each
+--   incoming double line together with its full per-offset decode `cdd_dec`. The
+--   C_BYTES parallel header decoders live here, between two registers (cd ..
+--   cdd_dec), off the recurrence. Two slots (rather than one) let the FIFO drain
+--   into the holding register and refill from `cd` on the *same* cycle, which is
+--   what covers the one-cycle latency of the registered cd_ready and sustains one
+--   line/cycle into the recurrence (e.g. the long-literal pop path). The line is
+--   pre-fetched/decoded while it waits, so the holding register below refills
+--   from an *already decoded* line with no bubble.
 --
 --   Stage 1 (recurrence): loads the holding register `cdh`/`cdh_dec` from the
 --   decode-all stage, then advances the loop-carried offset `off` and selects
@@ -223,11 +227,35 @@ architecture behavior of vhsnunzip_decoder_dual is
 begin
   proc: process (clk) is
 
-    -- Decode-all stage register (cd -> cdd): the incoming double line and its
-    -- full per-offset decode. The C_BYTES header decoders feed cdd_dec, which is
-    -- registered here so the recurrence in stage 1 never sees decode logic.
-    variable cdd     : compressed_stream_double := COMPRESSED_STREAM_DOUBLE_INIT;
-    variable cdd_dec : decoded_array(0 to C_BYTES-1) := (others => DECODED_INIT);
+    -- Decode-all stage (cd -> cdd): a depth-2 circular FIFO of incoming double
+    -- lines, each registered together with its full per-offset decode. The
+    -- C_BYTES header decoders feed cdd_dec(wp), registered here so the recurrence
+    -- in stage 1 never sees decode logic. Depth 2 (rather than the original single
+    -- slot) absorbs the one-cycle latency of the *registered* cd_ready: the drain
+    -- (cdd(rp) -> cdh) and the refill (cd -> cdd(wp)) hit different slots and so
+    -- can both fire every cycle, sustaining one line/cycle into the recurrence
+    -- (the long-literal pop path) instead of one line every two cycles.
+    constant CDD_DEPTH : natural := 2;
+    type cdd_array_t is array (natural range <>) of compressed_stream_double;
+    type cdd_dec_array_t is array (natural range <>) of decoded_array(0 to C_BYTES-1);
+    variable cdd     : cdd_array_t(0 to CDD_DEPTH-1) :=
+        (others => COMPRESSED_STREAM_DOUBLE_INIT);
+    variable cdd_dec : cdd_dec_array_t(0 to CDD_DEPTH-1) :=
+        (others => (others => DECODED_INIT));
+
+    -- Circular-FIFO read/write pointers (1-bit; wrap on +1 for CDD_DEPTH=2) and
+    -- occupancy count. The pointer arithmetic below assumes a power-of-two depth.
+    variable rp      : unsigned(0 downto 0) := (others => '0');
+    variable wp      : unsigned(0 downto 0) := (others => '0');
+    variable count   : natural range 0 to CDD_DEPTH := 0;
+
+    -- Mirror of the registered cd_ready output: the room-available value the
+    -- producer is currently observing (set last cycle from count). The refill
+    -- must gate on *this*, not on the live count -- because cd_ready is
+    -- registered, the producer holds cd valid until it sees the ready one cycle
+    -- later, so gating on live occupancy would re-accept the same line. (This is
+    -- exactly what the original `cdd_v0 = not cd_ready` snapshot guaranteed.)
+    variable cd_rdy  : std_logic := '0';
 
     -- Decoder input holding register and its decode, copied wholesale from the
     -- decode-all stage (pure register moves, no logic).
@@ -254,13 +282,6 @@ begin
     variable s2_free : boolean;
     variable s1_free : boolean;
 
-    -- Snapshot of the decode-all stage occupancy at the start of the cycle. Both
-    -- the cdd->cdh drain and the cd->cdd refill are gated on this snapshot so
-    -- they never fire in the same evaluation; that keeps the registered cd_ready
-    -- (= not cdd.valid) handshake honest and guarantees cdh_dec is always copied
-    -- from an already-registered cdd_dec, never a same-cycle decode.
-    variable cdd_v0  : std_logic;
-
   begin
     if rising_edge(clk) then
 
@@ -268,8 +289,6 @@ begin
       -- it is empty or its content moves downstream this cycle.
       s2_free := (elo.el0.valid = '0') or (el_ready = '1');
       s1_free := (s1.valid = '0') or s2_free;
-
-      cdd_v0 := cdd.valid;
 
       -- ================= Stage 2: format output from s1 =================
       -- Reads only the two registered decodes carried in s1.
@@ -306,12 +325,17 @@ begin
 
       -- ================= Holding register load (decode-all -> cdh) =========
       -- Runs before stage 1 so a freshly loaded line is decoded the same cycle
-      -- (no bubble). The decode array comes pre-registered from the decode-all
-      -- stage, so this is a pure register move.
-      if cdh.valid = '0' and cdd_v0 = '1' then
-        cdh       := cdd;
-        cdh_dec   := cdd_dec;
-        cdd.valid := '0';                 -- free the decode-all stage to refill
+      -- (no bubble). The decode array comes pre-registered from the FIFO head
+      -- slot cdd(rp), so this is a pure register move (the only new logic is the
+      -- rp-indexed read mux on the cdd_dec -> cdh_dec reg-to-reg hop). The head
+      -- slot is always one written in an earlier cycle: the refill below writes
+      -- cdd(wp), which is never the slot drained here in the same cycle.
+      if cdh.valid = '0' and count > 0 then
+        cdh       := cdd(to_integer(rp));
+        cdh_dec   := cdd_dec(to_integer(rp));
+        cdd(to_integer(rp)).valid := '0';     -- free the head slot to refill
+        rp        := rp + 1;
+        count     := count - 1;
         if cdh.first = '1' then           -- cdh.valid is '1' here by construction
           off := resize(cdh.start, 17);
         end if;
@@ -403,23 +427,35 @@ begin
 
       end if;
 
-      -- ================= Decode-all stage (cd -> cdd) =====================
-      -- Pre-fetch and decode the next line while it waits. The C_BYTES parallel
-      -- header decoders sit between cd (registered upstream) and cdd_dec
-      -- (registered here); each decodes at a fixed start offset, so there is no
-      -- off-driven byte mux. Gated on the start-of-cycle snapshot so it refills
-      -- the cycle *after* the drain above empties it (when cd_ready has gone
-      -- high), never the same cycle.
-      if cdd_v0 = '0' then
-        cdd := cd;
+      -- ================= Decode-all stage refill (cd -> cdd(wp)) ==========
+      -- Pre-fetch and decode the next line into the FIFO tail slot. The C_BYTES
+      -- parallel header decoders sit between cd (registered upstream) and
+      -- cdd_dec(wp) (registered here); each decodes at a fixed start offset, so
+      -- there is no off-driven byte mux (decode_one's output is just CE-selected
+      -- to slot wp). Accepts a line whenever the FIFO has room; with depth 2 this
+      -- can fire the same cycle as the drain above (different slots), covering the
+      -- one-cycle registered-cd_ready latency. Gated on the presented cd_rdy
+      -- (not live count): cd_rdy = '1' implies the FIFO had room at last cycle
+      -- end, and the drain above only frees slots, so room is guaranteed here.
+      if cd.valid = '1' and cd_rdy = '1' then
+        cdd(to_integer(wp)) := cd;
         for j in 0 to C_BYTES-1 loop
-          cdd_dec(j) := decode_one(cd.data, to_unsigned(j, off'length), cd.endi);
+          cdd_dec(to_integer(wp))(j) :=
+              decode_one(cd.data, to_unsigned(j, off'length), cd.endi);
         end loop;
+        wp    := wp + 1;
+        count := count + 1;
       end if;
 
       -- Handle reset.
       if reset = '1' then
-        cdd.valid := '0';
+        for i in 0 to CDD_DEPTH-1 loop
+          cdd(i).valid := '0';
+        end loop;
+        rp    := (others => '0');
+        wp    := (others => '0');
+        count := 0;
+        cd_rdy := '0';
         cdh.valid := '0';
         s1.valid  := '0';
         elo.el0.valid := '0';
@@ -427,8 +463,14 @@ begin
         off := (others => '0');
       end if;
 
-      -- Assign outputs.
-      cd_ready <= not cdd.valid;
+      -- Assign outputs. cd_ready is registered (FIFO has room for another line);
+      -- cd_rdy holds the same value for next cycle's refill gate.
+      if count < CDD_DEPTH then
+        cd_rdy := '1';
+      else
+        cd_rdy := '0';
+      end if;
+      cd_ready <= cd_rdy;
       el <= elo;
 
     end if;

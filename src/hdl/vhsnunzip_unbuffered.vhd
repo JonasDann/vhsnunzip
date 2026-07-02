@@ -19,11 +19,10 @@ entity vhsnunzip_unbuffered is
     -- the core will be a couple hundred LUTs smaller.
     LONG_CHUNKS : boolean := true;
 
-    -- Number of speculative element-1 start offsets the dual-issue decoder
-    -- evaluates. 0 selects the proven single-issue datapath; any value > 0
-    -- selects the speculative dual-issue datapath with that many offsets. See
-    -- C_SPEC_OFFSETS in vhsnunzip_utils_pkg.
-    SPEC_OFFSETS : natural := C_SPEC_OFFSETS;
+    -- Datapath selector. false selects the proven single-issue datapath; true
+    -- selects the dual-issue datapath (which retires up to two elements per
+    -- cycle). See C_DUAL_ISSUE in vhsnunzip_utils_pkg.
+    DUAL_ISSUE : boolean := C_DUAL_ISSUE;
 
     -- This block can use either 2 UltraRAMs or 16 Xilinx 36k block RAMs.
     -- Select "ultra" for UltraRAMs or "block" for block RAMs.
@@ -111,11 +110,11 @@ architecture behavior of vhsnunzip_unbuffered is
 
 begin
 
-  -- Datapath. The single-issue pipeline and the speculative dual-issue (fold)
-  -- pipeline have identical ports (minus the sim-only debug taps), so
-  -- SPEC_OFFSETS just selects which one is instantiated: 0 -> single-issue,
-  -- > 0 -> dual-issue with that many speculative offsets.
-  single_datapath_gen: if SPEC_OFFSETS = 0 generate
+  -- Datapath. The single-issue pipeline and the dual-issue (fold)
+  -- pipeline have identical ports (minus the sim-only debug taps), so DUAL_ISSUE
+  -- just selects which one is instantiated: false -> single-issue, true ->
+  -- dual-issue (always built at full co-issue coverage, C_SPEC_OFFSETS).
+  single_datapath_gen: if not DUAL_ISSUE generate
     datapath_inst: vhsnunzip_pipeline
       generic map (
         LONG_CHUNKS => LONG_CHUNKS
@@ -136,11 +135,11 @@ begin
       );
   end generate;
 
-  dual_datapath_gen: if SPEC_OFFSETS > 0 generate
+  dual_datapath_gen: if DUAL_ISSUE generate
     datapath_inst: vhsnunzip_pipeline_dual
       generic map (
         LONG_CHUNKS => LONG_CHUNKS,
-        SPEC_OFFSETS => SPEC_OFFSETS
+        SPEC_OFFSETS => C_SPEC_OFFSETS
       )
       port map (
         clk          => clk,
@@ -275,7 +274,7 @@ begin
   -- on the write port), and read independently at cm1's address, giving cm0 and
   -- cm1 independent long-term read ports. Only instantiated for the dual-issue
   -- datapath; single-issue leaves the second port unused.
-  lt_mirror_gen: if SPEC_OFFSETS > 0 generate
+  lt_mirror_gen: if DUAL_ISSUE generate
 
     ev_rd_cmd1 <= (
       valid => lt_rd_valid1,
