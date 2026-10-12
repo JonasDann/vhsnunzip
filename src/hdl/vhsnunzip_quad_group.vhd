@@ -67,19 +67,25 @@ end vhsnunzip_quad_group;
 
 architecture behavior of vhsnunzip_quad_group is
 
-  subtype pos_type is unsigned(19 downto 0);
+  -- Output positions modulo 2^18: every comparison is between positions less
+  -- than 2^17 apart (a chunk is at most 64 KiB).
+  constant PW : natural := 18;
+  subtype pos_type is unsigned(PW-1 downto 0);
+
+  type u7x3_type is array (1 to 3) of unsigned(6 downto 0);
 
   -- Element with absolute positions and precomputed copy information.
   type qe_type is record
     cp     : unsigned(6 downto 0);
     off    : unsigned(15 downto 0);
     li     : unsigned(16 downto 0);
-    q      : unsigned(19 downto 0);
+    q      : pos_type;
     last   : std_logic;
     pw2    : std_logic;
     s4     : std_logic;
     strb   : std_logic;   -- strideable (offset 4 or 8)
-    o      : pos_type;    -- start
+    hascp  : std_logic;   -- cp /= 0
+    o      : pos_type;    -- start (pre-pass only)
     ecp    : pos_type;    -- copy end
     e      : pos_type;    -- end
     om32   : pos_type;    -- start - 32
@@ -99,30 +105,38 @@ architecture behavior of vhsnunzip_quad_group is
     par    : std_logic;   -- bank (line parity) of the first source line
     ovl    : std_logic;   -- self-overlapping (off < cp)
     olt32  : std_logic;   -- off < 32
-    ytgt   : pos_type;    -- CSR: end of the source part (pre-pass only)
+    len7   : unsigned(6 downto 0);  -- min(cp + li, 127) (pre-pass only)
+    -- CSR candidates, source in element (this - d) (pre-pass only): match,
+    -- in its literal part, strideable source, bytes of the copy covered.
+    cm     : std_logic_vector(1 to 3);
+    cpt    : std_logic_vector(1 to 3);
+    ctg    : std_logic_vector(1 to 3);
+    ccv    : u7x3_type;
   end record;
 
   constant QE_ZERO : qe_type := (
     cp => (others => '0'), off => (others => '0'), li => (others => '0'), q => (others => '0'),
-    last => '0', pw2 => '0', s4 => '0', strb => '0',
+    last => '0', pw2 => '0', s4 => '0', strb => '0', hascp => '0',
     o => (others => '0'), ecp => (others => '0'), e => (others => '0'),
     om32 => (others => '0'), em32 => (others => '0'),
     src => (others => '0'), srce => (others => '0'),
     stopc => (others => '0'), stopc32 => (others => '0'),
     stopl => (others => '0'), stopl32 => (others => '0'),
     jd => "00", part => '0', cutc => '0', tgts => '0', lt => '0', two => '0', par => '0',
-    ovl => '0', olt32 => '0', ytgt => (others => '0'));
+    ovl => '0', olt32 => '0', len7 => (others => '0'),
+    cm => "000", cpt => "000", ctg => "000", ccv => (others => (others => '0')));
 
   type qe_array is array (natural range <>) of qe_type;
-  type u20_array is array (natural range <>) of unsigned(19 downto 0);
+  type pos_array is array (natural range <>) of pos_type;
 
-  constant QE_BITS : natural := 7 + 16 + 17 + 20 + 4 + 11*20 + 2 + 8;
+  -- What the group former needs of an element after the FIFO.
+  constant QE_BITS : natural := 16 + 17 + PW + 5 + 10*PW + 2 + 8;
 
   function qe_pack(e : qe_type) return std_logic_vector is
   begin
-    return std_logic_vector(e.cp) & std_logic_vector(e.off) & std_logic_vector(e.li)
-         & std_logic_vector(e.q) & e.last & e.pw2 & e.s4 & e.strb
-         & std_logic_vector(e.o) & std_logic_vector(e.ecp) & std_logic_vector(e.e)
+    return std_logic_vector(e.off) & std_logic_vector(e.li)
+         & std_logic_vector(e.q) & e.last & e.pw2 & e.s4 & e.strb & e.hascp
+         & std_logic_vector(e.ecp) & std_logic_vector(e.e)
          & std_logic_vector(e.om32) & std_logic_vector(e.em32)
          & std_logic_vector(e.src) & std_logic_vector(e.srce)
          & std_logic_vector(e.stopc) & std_logic_vector(e.stopc32)
@@ -131,45 +145,47 @@ architecture behavior of vhsnunzip_quad_group is
   end function;
 
   function qe_unpack(v : std_logic_vector(QE_BITS-1 downto 0)) return qe_type is
-    variable e : qe_type;
-    constant B0 : natural := QE_BITS;
-    constant BP : natural := B0 - 7 - 16 - 17 - 20 - 4;
+    variable e : qe_type := QE_ZERO;
+    variable i : natural := QE_BITS;
+    impure function take(n : natural) return unsigned is
+    begin
+      i := i - n;
+      return unsigned(v(i+n-1 downto i));
+    end function;
   begin
-    e.cp := unsigned(v(B0-1 downto B0-7));
-    e.off := unsigned(v(B0-8 downto B0-23));
-    e.li := unsigned(v(B0-24 downto B0-40));
-    e.q := unsigned(v(B0-41 downto B0-60));
-    e.last := v(B0-61); e.pw2 := v(B0-62); e.s4 := v(B0-63); e.strb := v(B0-64);
-    e.o       := unsigned(v(BP-1   downto BP-20));
-    e.ecp     := unsigned(v(BP-21  downto BP-40));
-    e.e       := unsigned(v(BP-41  downto BP-60));
-    e.om32    := unsigned(v(BP-61  downto BP-80));
-    e.em32    := unsigned(v(BP-81  downto BP-100));
-    e.src     := unsigned(v(BP-101 downto BP-120));
-    e.srce    := unsigned(v(BP-121 downto BP-140));
-    e.stopc   := unsigned(v(BP-141 downto BP-160));
-    e.stopc32 := unsigned(v(BP-161 downto BP-180));
-    e.stopl   := unsigned(v(BP-181 downto BP-200));
-    e.stopl32 := unsigned(v(BP-201 downto BP-220));
+    e.off := take(16);
+    e.li := take(17);
+    e.q := take(PW);
+    e.last := v(i-1); e.pw2 := v(i-2); e.s4 := v(i-3); e.strb := v(i-4); e.hascp := v(i-5);
+    i := i - 5;
+    e.ecp := take(PW);
+    e.e := take(PW);
+    e.om32 := take(PW);
+    e.em32 := take(PW);
+    e.src := take(PW);
+    e.srce := take(PW);
+    e.stopc := take(PW);
+    e.stopc32 := take(PW);
+    e.stopl := take(PW);
+    e.stopl32 := take(PW);
     e.jd := unsigned(v(9 downto 8));
     e.part := v(7); e.cutc := v(6); e.tgts := v(5); e.lt := v(4);
     e.two := v(3); e.par := v(2); e.ovl := v(1); e.olt32 := v(0);
-    e.ytgt := (others => '0');
     return e;
   end function;
 
-  -- Signed comparison of positions (modulo 2^20).
+  -- Signed comparison of positions.
   function lt_pos(a : pos_type; b : pos_type) return boolean is
     variable d : pos_type;
   begin
     d := a - b;
-    return d(19) = '1';
+    return d(PW-1) = '1';
   end function;
 
   -- Pre-pass stage 0: lengths and in-batch prefix sums.
   signal p0_el    : qe_array(0 to QK-1);
-  signal p0_ps    : u20_array(0 to QK-1);
-  signal p0_pe    : u20_array(0 to QK-1);
+  signal p0_ps    : pos_array(0 to QK-1);
+  signal p0_pe    : pos_array(0 to QK-1);
   signal p0_cnt   : unsigned(2 downto 0) := "000";
   signal p0_hasl  : std_logic := '0';
 
@@ -199,11 +215,11 @@ architecture behavior of vhsnunzip_quad_group is
   signal fwe      : std_logic_vector(0 to 3);
   signal fwa      : u5_array(0 to 3);
   signal fwd      : qe_array(0 to 3);
-  signal frd      : qe_array(0 to 3);
+  type slv_qe_array is array (natural range <>) of std_logic_vector(QE_BITS-1 downto 0);
+  signal frp      : slv_qe_array(0 to 3);
   signal wp       : unsigned(FD_LOG2+2 downto 0) := (others => '0');
   signal rp       : unsigned(FD_LOG2+2 downto 0) := (others => '0');
   signal fcnt     : unsigned(FD_LOG2+2 downto 0);
-  signal fv       : qe_array(0 to QK-1);
 
   -- Group former state.
   signal w        : qe_array(0 to QK-1) := (others => QE_ZERO);
@@ -214,7 +230,7 @@ architecture behavior of vhsnunzip_quad_group is
   signal hecpo2   : pos_type;
   signal hfresh   : std_logic := '1';
   signal bubble   : std_logic := '0';
-  signal wpos_r   : unsigned(19 downto 0) := (others => '0');
+  signal wpos_r   : pos_type := (others => '0');
   signal resv_r   : std_logic_vector(1 downto 0) := "00";
   signal lsafe    : std_logic := '0';
 
@@ -264,17 +280,25 @@ begin
         x.cp := e.cp;
         x.off := e.off;
         x.li := e.li;
-        x.q := e.q;
+        x.q := e.q(PW-1 downto 0);
         x.last := e.last;
         x.pw2 := e.pw2;
         x.s4 := e.s4;
+        if e.cp /= 0 then
+          x.hascp := '1';
+        end if;
         if e.cp /= 0 and (e.s4 = '1' or e.s8 = '1') then
           x.strb := '1';
+        end if;
+        if e.li(16 downto 7) /= 0 or resize(e.cp, 8) + resize(e.li(6 downto 0), 8) > 127 then
+          x.len7 := (others => '1');
+        else
+          x.len7 := resize(e.cp + e.li(6 downto 0), 7);
         end if;
         p0_el(k) <= x;
         p0_ps(k) <= acc;
         if k < el_cnt then
-          acc := acc + resize(e.cp, 20) + resize(e.li, 20);
+          acc := acc + resize(e.cp, PW) + resize(e.li, PW);
           if e.last = '1' then
             p0_hasl <= '1';
           end if;
@@ -296,7 +320,7 @@ begin
       for k in 0 to QK-1 loop
         x := p0_el(k);
         x.o := run_sum + p0_ps(k);
-        x.ecp := run_sum + p0_ps(k) + resize(x.cp, 20);
+        x.ecp := run_sum + p0_ps(k) + resize(x.cp, PW);
         x.e := run_sum + p0_pe(k);
         p1_os(k) <= x;
       end loop;
@@ -326,8 +350,8 @@ begin
         x := p1_os(k);
         x.om32 := x.o - 32;
         x.em32 := x.e - 32;
-        x.src := x.o - resize(x.off, 20);
-        x.srce := x.src + resize(x.cp, 20);
+        x.src := x.o - resize(x.off, PW);
+        x.srce := x.src + resize(x.cp, PW);
         if x.off < x.cp then x.ovl := '1'; end if;
         if x.off < 32 then x.olt32 := '1'; end if;
         -- Long-term copy. Offsets up to 960 are always within the 32 lines of
@@ -341,8 +365,8 @@ begin
           x.two := '1';
         end if;
         x.par := x.src(5);
-        x.stopl := x.o + 32 - resize(slan, 20);
-        x.stopl32 := x.o - resize(slan, 20);
+        x.stopl := x.o + 32 - resize(slan, PW);
+        x.stopl32 := x.o - resize(slan, PW);
         p2a(k) <= x;
       end loop;
       p2a_cnt <= p1_cnt;
@@ -352,13 +376,22 @@ begin
     end if;
   end process;
 
-  -- Stage 2b: copy-source location among the three preceding elements.
+  -- Stage 2b: copy-source location among the three preceding elements. A
+  -- source inside the group needs off < 32 (the copy starts inside the
+  -- group), so only the bytes just before the element matter: the distances
+  -- back from its start to the preceding element boundaries are sums of the
+  -- preceding lengths (saturated at 127). The three candidates are checked
+  -- in parallel; stage 2c selects.
   p2b_proc: process (clk) is
     variable lst  : qe_array(0 to QK+2);
     variable lv   : std_logic_vector(0 to QK+2);
     variable x    : qe_type;
     variable y    : qe_type;
     variable hasl : boolean;
+    type u8_arr is array (natural range <>) of unsigned(7 downto 0);
+    variable bb   : u8_arr(0 to 3);
+    variable sb   : unsigned(7 downto 0);
+    variable off8 : unsigned(7 downto 0);
   begin
     if rising_edge(clk) then
       lst(0 to 2) := tail;
@@ -371,20 +404,28 @@ begin
       hasl := false;
       for k in 0 to QK-1 loop
         x := lst(3 + k);
-        x.jd := "00";
-        for d in 3 downto 1 loop
+        off8 := resize(x.off(4 downto 0), 8);
+        bb(0) := (others => '0');
+        bb(1) := resize(lst(2 + k).len7, 8);
+        bb(2) := bb(1) + resize(lst(1 + k).len7, 8);
+        bb(3) := bb(2) + resize(lst(k).len7, 8);
+        if bb(3)(7) = '1' then bb(3) := to_unsigned(127, 8); end if;
+        if bb(2)(7) = '1' then bb(2) := to_unsigned(127, 8); bb(3) := to_unsigned(127, 8); end if;
+        for d in 1 to 3 loop
           y := lst(3 + k - d);
-          if lv(3 + k - d) = '1' and not lt_pos(x.src, y.o) and lt_pos(x.src, y.e) then
-            x.jd := to_unsigned(d, 2);
-            if lt_pos(x.src, y.ecp) then
-              x.part := '0';
-              x.ytgt := y.ecp;
-              x.tgts := y.strb;
-            else
-              x.part := '1';
-              x.ytgt := y.e;
-              x.tgts := '0';
-            end if;
+          x.cm(d) := '0';
+          if lv(3 + k - d) = '1' and x.olt32 = '1' and bb(d - 1) < off8 and off8 <= bb(d) then
+            x.cm(d) := '1';
+          end if;
+          sb := bb(d) - off8;
+          if sb < y.cp then
+            x.cpt(d) := '0';
+            x.ctg(d) := y.strb;
+            x.ccv(d) := resize(resize(y.cp, 8) - sb, 7);
+          else
+            x.cpt(d) := '1';
+            x.ctg(d) := '0';
+            x.ccv(d) := resize(off8 - bb(d - 1), 7);
           end if;
         end loop;
         p2b(k) <= x;
@@ -410,21 +451,32 @@ begin
     end if;
   end process;
 
-  -- Stage 2c: how far the source part covers the copy, and the cut position.
+  -- Stage 2c: CSR source element and how far its part covers the copy (at
+  -- most 63), and the cut position of a copy whose source part ends first.
   p2c_proc: process (clk) is
     variable x    : qe_type;
-    variable cov  : pos_type;
+    variable cov  : unsigned(6 downto 0);
   begin
     if rising_edge(clk) then
       for k in 0 to QK-1 loop
         x := p2b(k);
-        cov := x.ytgt - x.src;
-        if x.jd = 0 or cov(19 downto 6) /= 0 then
-          cov := to_unsigned(63, 20);
-        end if;
+        x.jd := "00";
+        x.part := '0';
+        x.tgts := '0';
+        cov := to_unsigned(63, 7);
+        for d in 1 to 3 loop
+          if x.cm(d) = '1' then
+            x.jd := to_unsigned(d, 2);
+            x.part := x.cpt(d);
+            x.tgts := x.ctg(d);
+            if x.ccv(d) < 63 then
+              cov := x.ccv(d);
+            end if;
+          end if;
+        end loop;
         if cov < x.cp then x.cutc := '1'; end if;
-        x.stopc := x.o + cov;
-        x.stopc32 := x.om32 + cov;
+        x.stopc := x.o + resize(cov, PW);
+        x.stopc32 := x.om32 + resize(cov, PW);
         p2(k) <= x;
       end loop;
       p2_cnt <= p2b_cnt;
@@ -479,18 +531,11 @@ begin
       idx := rp + resize(to_unsigned(b, 2) - rp(1 downto 0), FD_LOG2+3);
       a := to_integer(idx(FD_LOG2+1 downto 2));
       case b is
-        when 0 => frd(0) <= qe_unpack(fmem0(a));
-        when 1 => frd(1) <= qe_unpack(fmem1(a));
-        when 2 => frd(2) <= qe_unpack(fmem2(a));
-        when others => frd(3) <= qe_unpack(fmem3(a));
+        when 0 => frp(0) <= fmem0(a);
+        when 1 => frp(1) <= fmem1(a);
+        when 2 => frp(2) <= fmem2(a);
+        when others => frp(3) <= fmem3(a);
       end case;
-    end loop;
-  end process;
-
-  fv_comb: process (frd, rp) is
-  begin
-    for i in 0 to QK-1 loop
-      fv(i) <= frd(to_integer(rp(1 downto 0) + i));
     end loop;
   end process;
 
@@ -518,12 +563,12 @@ begin
   -----------------------------------------------------------------------------
   lsafe_proc: process (clk) is
     variable d    : unsigned(15 downto 0);
-    variable d20  : unsigned(19 downto 0);
-    variable lend : unsigned(19 downto 0);
+    variable d20  : pos_type;
+    variable lend : pos_type;
     variable ok   : std_logic;
   begin
     if rising_edge(clk) then
-      wpos_r <= lb_wpos;
+      wpos_r <= lb_wpos(PW-1 downto 0);
       resv_r <= wq_resv;
       d := wpos_r(15 downto 0) - gr.lnext;
       ok := '0';
@@ -535,11 +580,11 @@ begin
       lend := (others => '0');
       for k in 0 to QK-1 loop
         if wv(k) = '1' then
-          lend := w(k).q + resize(w(k).li, 20);
+          lend := w(k).q + resize(w(k).li, PW);
         end if;
       end loop;
       d20 := wpos_r - lend;
-      if wv(0) = '1' and d20(19) = '0' then
+      if wv(0) = '1' and d20(PW-1) = '0' then
         ok := '1';
       end if;
       lsafe <= ok;
@@ -574,7 +619,7 @@ begin
     variable fin      : std_logic_vector(0 to QK-1);
     variable act      : std_logic_vector(0 to QK-1);
     variable lastk    : std_logic_vector(0 to QK-1);
-    variable stp      : u20_array(0 to QK-1);
+    variable stp      : pos_array(0 to QK-1);
     variable rep0     : std_logic;
     variable dbl0     : std_logic;
     variable conf     : std_logic;
@@ -590,14 +635,13 @@ begin
     variable moh      : std_logic_vector(0 to QK);
     variable nv       : integer range 0 to QK;
     variable fc       : integer range 0 to QK;
-    variable comb     : qe_array(0 to 2*QK-1);
     variable nw       : qe_array(0 to QK-1);
     variable nwv      : std_logic_vector(0 to QK-1);
     variable nrp      : unsigned(FD_LOG2+2 downto 0);
     variable cand     : unsigned(FD_LOG2+2 downto 0);
-    type slv_qe_array is array (natural range <>) of std_logic_vector(QE_BITS-1 downto 0);
-    variable nwp      : slv_qe_array(0 to QK-1);
-    variable cv       : std_logic_vector(QE_BITS-1 downto 0);
+    variable csrc     : slv_qe_array(0 to 2*QK-1);
+    variable ws       : u3_array(0 to QK-1);
+    variable code     : unsigned(2 downto 0);
     variable keep     : integer range 0 to QK;
     variable pop      : integer range 0 to QK;
     variable vcnt     : integer range 0 to 2*QK;
@@ -641,7 +685,7 @@ begin
           if hov = '1' then
             dbl0 := '1';
             cut(0) := '1';
-            stp(0) := p + resize(hoff(4 downto 0), 20);
+            stp(0) := p + resize(hoff(4 downto 0), PW);
           end if;
         end if;
       end if;
@@ -654,7 +698,7 @@ begin
             conf := '1';
           end if;
         end loop;
-        if w(k).cp /= 0 then
+        if w(k).hascp = '1' then
           if w(k).strb = '1' and conf = '0' then
             str(k) := '1';
           elsif w(k).ovl = '1' then
@@ -672,7 +716,7 @@ begin
             hist(k) := '1';
             if lt_pos(p, w(k).srce) and w(k).olt32 = '1' then
               cut(k) := '1';
-              stp(k) := p + resize(w(k).off(4 downto 0), 20);
+              stp(k) := p + resize(w(k).off(4 downto 0), PW);
             end if;
           end if;
         end if;
@@ -755,7 +799,7 @@ begin
       moh := (others => '0');
       moh(0) := not act(0);
       for k in 0 to QK-1 loop
-        for b in 0 to 19 loop
+        for b in 0 to PW-1 loop
           pend(b) := pend(b) or (lastk(k) and fin(k) and w(k).e(b))
                              or (lastk(k) and not fin(k) and stp(k)(b));
         end loop;
@@ -793,8 +837,10 @@ begin
         end if;
       end if;
 
-      -- Candidate windows for every number of consumed elements m: the
-      -- window is (W ++ FIFO)[m .. m+3].
+      -- Next window: slot i takes element i + m of (W ++ FIFO), where m is
+      -- the number of consumed elements (one-hot moh). Per slot that is one
+      -- binary select over the window entries (0 .. 3) and the FIFO bank
+      -- outputs (4 .. 7; FIFO element t is in bank (rp + t) mod 4).
       nv := 0;
       for k in 0 to QK-1 loop
         if wv(k) = '1' then
@@ -802,19 +848,9 @@ begin
         end if;
       end loop;
       if fcnt >= QK then fc := QK; else fc := to_integer(fcnt); end if;
-      for i in 0 to 2*QK-1 loop
-        comb(i) := QE_ZERO;
-        for s in 0 to 2*QK-1 loop
-          if s < QK and s = i and i < nv then
-            comb(i) := w(s);
-          elsif s >= QK and i >= nv and s - QK = i - nv then
-            comb(i) := fv(s - QK);
-          end if;
-        end loop;
-      end loop;
-      nwp := (others => (others => '0'));
       nwv := (others => '0');
       nrp := (others => '0');
+      ws := (others => "000");
       for m in 0 to QK loop
         if m <= nv then
           keep := nv - m;
@@ -831,16 +867,22 @@ begin
           if i < vcnt then
             nwv(i) := nwv(i) or moh(m);
           end if;
-          if i + m < 2*QK then
-            cv := qe_pack(comb(i + m));
-            for b in 0 to QE_BITS-1 loop
-              nwp(i)(b) := nwp(i)(b) or (moh(m) and cv(b));
-            end loop;
+          if i + m < nv then
+            code := to_unsigned(i + m, 3);
+          else
+            code := '1' & (rp(1 downto 0) + to_unsigned((i + m - nv) mod 4, 2));
           end if;
+          for b in 0 to 2 loop
+            ws(i)(b) := ws(i)(b) or (moh(m) and code(b));
+          end loop;
         end loop;
       end loop;
+      for j in 0 to QK-1 loop
+        csrc(j) := qe_pack(w(j));
+        csrc(QK + j) := frp(j);
+      end loop;
       for i in 0 to QK-1 loop
-        nw(i) := qe_unpack(nwp(i));
+        nw(i) := qe_unpack(csrc(to_integer(ws(i))));
       end loop;
       w <= nw;
       wv <= nwv;
@@ -873,7 +915,7 @@ begin
   end process;
 
   -- Copy end minus twice the head offset, for when the offset doubles.
-  hecpo2 <= w(0).ecp - resize(hoff & '0', 20);
+  hecpo2 <= w(0).ecp - resize(hoff & '0', PW);
 
   -----------------------------------------------------------------------------
   -- G2b: build the group command.
@@ -907,7 +949,7 @@ begin
         if k = 0 then
           st := sn.p0;
         else
-          st := x.o;
+          st := x.om32 + 32;
         end if;
         -- Copy part [max(o, p0), min(ecp, pe)), literal part [max(ecp, p0), min(e, pe)).
         cs := st;
@@ -950,7 +992,7 @@ begin
         g.s(k).lt := sn.lt(k) and sn.hist(k);
 
         -- Long-term lines (ports are assigned in the next stage).
-        src := st - resize(g.s(k).off, 20);
+        src := st - resize(g.s(k).off, PW);
         ltl(k) := src(15 downto 5);
         ltr(k) := '0';
         ltt(k) := '0';

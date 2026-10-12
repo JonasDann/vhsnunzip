@@ -132,12 +132,14 @@ package vhsnunzip_quad_pkg is
   type u5_array is array (natural range <>) of unsigned(4 downto 0);
   type u2_array is array (natural range <>) of unsigned(1 downto 0);
   type u3_array is array (natural range <>) of unsigned(2 downto 0);
+  type u4_array is array (natural range <>) of unsigned(3 downto 0);
   type u6_array is array (natural range <>) of unsigned(5 downto 0);
   type u7_array is array (natural range <>) of unsigned(6 downto 0);
   type u16_array is array (natural range <>) of unsigned(15 downto 0);
   type ck_array is array (natural range <>) of std_logic_vector(2 downto 0);
   type u5_matrix is array (natural range <>) of u5_array(0 to QB-1);
   type u2_matrix is array (natural range <>) of u2_array(0 to QB-1);
+  type u3_matrix is array (natural range <>) of u3_array(0 to QB-1);
   type byte_matrix is array (natural range <>) of byte_array(0 to QB-1);
 
   -- Rotate left: result(x) = v((x + r) mod QB).

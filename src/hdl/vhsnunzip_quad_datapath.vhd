@@ -6,6 +6,99 @@ library work;
 use work.vhsnunzip_int_pkg.all;
 use work.vhsnunzip_quad_pkg.all;
 
+-- S2a of the quad datapath: copy source select per slot, rotators and merge
+-- (registered output). Kept as its own hierarchy level so synthesis maps
+-- the merge onto wide multiplexers.
+entity vhsnunzip_quad_merge is
+  port (
+    clk   : in  std_logic;
+    sc    : in  u3_matrix(0 to QK-1);
+    rot   : in  u4_array(0 to QK-1);
+    lrot  : in  u4_array(0 to QK-1);
+    own   : in  u4_array(0 to QB-1);
+    st_rd : in  byte_matrix(0 to QK-1);
+    lb_rd : in  byte_matrix(0 to QK-1);
+    lt    : in  byte_matrix(0 to 3);
+    m     : out byte_array(0 to QB-1)
+  );
+end vhsnunzip_quad_merge;
+
+architecture behavior of vhsnunzip_quad_merge is
+
+  -- Rotate left by r (0 .. 15): the first two stages of rotl. The last stage
+  -- (by 16) is part of the merge.
+  function rotl4(v : byte_array(0 to QB-1); r : unsigned(3 downto 0)) return byte_array is
+    variable a, b : byte_array(0 to QB-1);
+  begin
+    for x in 0 to QB-1 loop
+      a(x) := v((x + to_integer(r(1 downto 0))) mod QB);
+    end loop;
+    for x in 0 to QB-1 loop
+      b(x) := a((x + 4 * to_integer(r(3 downto 2))) mod QB);
+    end loop;
+    return b;
+  end function;
+
+begin
+
+  s2a_proc: process (clk) is
+    variable sv    : byte_array(0 to QB-1);
+    variable rc    : byte_matrix(0 to QK-1);
+    variable rl    : byte_matrix(0 to QK-1);
+    variable s     : unsigned(2 downto 0);
+    variable pc    : byte_array(0 to 4*QK-1);
+  begin
+    if rising_edge(clk) then
+      for k in 0 to QK-1 loop
+        for ly in 0 to QB-1 loop
+          s := sc(k)(ly);
+          if k = 0 then
+            case s(1 downto 0) is
+              when "01" => sv(ly) := lt(0)(ly);
+              when "10" => sv(ly) := lt(2)(ly);
+              when others => sv(ly) := st_rd(0)(ly);
+            end case;
+          else
+            case to_integer(s) is
+              when 1 => sv(ly) := lt(0)(ly);
+              when 2 => sv(ly) := lt(1)(ly);
+              when 3 => sv(ly) := lt(2)(ly);
+              when 4 => sv(ly) := lt(3)(ly);
+              when 5 => sv(ly) := lb_rd(0)(ly);
+              when 6 =>
+                if k >= 2 then sv(ly) := lb_rd(1)(ly); else sv(ly) := st_rd(k)(ly); end if;
+              when 7 =>
+                if k >= 3 then sv(ly) := lb_rd(2)(ly); else sv(ly) := st_rd(k)(ly); end if;
+              when others => sv(ly) := st_rd(k)(ly);
+            end case;
+          end if;
+        end loop;
+        rc(k) := rotl4(sv, rot(k));
+        rl(k) := rotl4(lb_rd(k), lrot(k));
+      end loop;
+      -- Merge, including the last rotation stage (by 16).
+      for x in 0 to QB-1 loop
+        for k in 0 to QK-1 loop
+          pc(4*k) := rc(k)(x);
+          pc(4*k+1) := rc(k)((x + 16) mod QB);
+          pc(4*k+2) := rl(k)(x);
+          pc(4*k+3) := rl(k)((x + 16) mod QB);
+        end loop;
+        m(x) <= pc(to_integer(own(x)));
+      end loop;
+    end if;
+  end process;
+
+end behavior;
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+library work;
+use work.vhsnunzip_int_pkg.all;
+use work.vhsnunzip_quad_pkg.all;
+
 -- Datapath of the quad core. Fixed-latency pipeline (no stalls):
 --
 --   R0  : group from the group former (long-term reads are issued from R0)
@@ -68,28 +161,30 @@ architecture behavior of vhsnunzip_quad_datapath is
   signal r1       : qgroup_type := QGROUP_ZERO;
   signal r1res    : qres_array(0 to QK-1);
 
-  -- Stride source per lane: one-hot over the distance 4*i, i = 1 .. 8.
-  type sl8_array is array (natural range <>) of std_logic_vector(1 to 8);
 
-  -- R2: per-slot scalars.
+  -- R2: per-slot scalars. Piece boundaries are relative to the group start
+  -- (saturated at 63): the copy part of slot k is [pos, cb), its literal part
+  -- [cb, lb); the copy bytes from rb on come from the recent register.
   type s1a_slot_type is record
-    act   : std_logic;
-    pos   : unsigned(5 downto 0);
-    c     : unsigned(5 downto 0);
-    l     : unsigned(5 downto 0);
+    rb    : unsigned(5 downto 0);
+    cb    : unsigned(5 downto 0);
+    lb    : unsigned(5 downto 0);
     rk    : std_logic_vector(2 downto 0);
     rsl   : unsigned(1 downto 0);
     rot   : unsigned(4 downto 0);
+    lrot  : unsigned(4 downto 0);
     srcl  : unsigned(4 downto 0);
     sline : unsigned(4 downto 0);
     pid1  : unsigned(1 downto 0);
     pid2  : unsigned(1 downto 0);
-    dist  : unsigned(6 downto 0);
-    off   : unsigned(4 downto 0);
-    sh    : unsigned(4 downto 0);
     qlane : unsigned(4 downto 0);
     qline : unsigned(4 downto 0);
-    lrot  : unsigned(4 downto 0);
+    -- Recent-register index of a copy byte at output lane x:
+    -- ((x + ia) and im) + ib.
+    ia    : unsigned(4 downto 0);
+    ib    : unsigned(4 downto 0);
+    im    : unsigned(4 downto 0);
+    strf  : std_logic;
   end record;
   type s1a_slot_array is array (natural range <>) of s1a_slot_type;
 
@@ -115,22 +210,22 @@ architecture behavior of vhsnunzip_quad_datapath is
     last  : std_logic;
     line0 : unsigned(10 downto 0);
     lnext : unsigned(15 downto 0);
-    -- per slot
-    rk    : ck_array(0 to QK-1);
-    rsl   : u2_array(0 to QK-1);
-    rot   : u5_array(0 to QK-1);
-    lrot  : u5_array(0 to QK-1);
+    -- per slot: rotation (without bit 4) of the copy and literal sources,
+    -- and per source lane: memory addresses and copy source select
+    -- (0: short-term, 1 .. 4: long-term port, 5 .. 7: literal of slot 0 .. 2;
+    -- slot 0 only uses 0, 1 and 2 = long-term port 2).
+    rot   : u4_array(0 to QK-1);
+    lrot  : u4_array(0 to QK-1);
     st_a  : u5_matrix(0 to QK-1);
     li_a  : u5_matrix(0 to QK-1);
-    lt_p  : u2_matrix(0 to QK-1);
-    -- per output lane
+    sc    : u3_matrix(0 to QK-1);
+    -- per output lane: piece select (slot, literal, rotation bit 4)
+    own   : u4_array(0 to QB-1);
     ing   : std_logic_vector(0 to QB-1);
-    own   : u3_array(0 to QB-1);
     rec   : std_logic_vector(0 to QB-1);
     idx   : u5_array(0 to QB-1);
     str   : std_logic_vector(0 to QB-1);
-    slw   : std_logic_vector(0 to QB-1);
-    sone  : sl8_array(0 to QB-1);
+    sdi   : u3_array(0 to QB-1);    -- stride source distance 4 * (sdi + 1)
   end record;
   signal r3       : s1b_type;
   signal r3_valid : std_logic := '0';
@@ -141,16 +236,18 @@ architecture behavior of vhsnunzip_quad_datapath is
     n     : unsigned(5 downto 0);
     last  : std_logic;
     line0 : unsigned(10 downto 0);
-    m     : byte_array(0 to QB-1);
     ing   : std_logic_vector(0 to QB-1);
     rec   : std_logic_vector(0 to QB-1);
     idx   : u5_array(0 to QB-1);
     str   : std_logic_vector(0 to QB-1);
-    slw   : std_logic_vector(0 to QB-1);
-    sone  : sl8_array(0 to QB-1);
+    sdi   : u3_array(0 to QB-1);    -- stride source distance 4 * (sdi + 1)
   end record;
   signal r4       : s2a_type;
   signal r4_valid : std_logic := '0';
+  signal r4m      : byte_array(0 to QB-1);
+
+  attribute keep_hierarchy : string;
+  attribute keep_hierarchy of merge_inst : label is "yes";
 
   -- Memory read results in S2a.
   signal st_rd    : byte_matrix(0 to QK-1);
@@ -163,6 +260,7 @@ architecture behavior of vhsnunzip_quad_datapath is
   signal st_wa    : u5_array(0 to QB-1);
   signal pend     : std_logic := '0';
   signal pend_cnt : unsigned(QI downto 0);
+  signal oline    : byte_array(0 to QB-1);
 
   function pid_of(line : unsigned(10 downto 0); g : qgroup_type) return unsigned is
     variable b : integer range 0 to 1;
@@ -174,6 +272,15 @@ architecture behavior of vhsnunzip_quad_datapath is
       return to_unsigned(2*b + 1, 2);
     end if;
   end function;
+
+  function sat6(v : unsigned) return unsigned is
+  begin
+    if v > 63 then
+      return to_unsigned(63, 6);
+    end if;
+    return resize(v, 6);
+  end function;
+
 
 begin
 
@@ -285,6 +392,9 @@ begin
     variable dist  : unsigned(15 downto 0);
     variable line  : unsigned(10 downto 0);
     variable rr    : unsigned(5 downto 0);
+    variable cb    : unsigned(6 downto 0);
+    variable lb    : unsigned(6 downto 0);
+    variable rb    : unsigned(6 downto 0);
     variable v     : s1a_type;
   begin
     if rising_edge(clk) then
@@ -314,10 +424,32 @@ begin
         o := r1.p0 + resize(r1.s(k).pos, 16);
         ol := o + resize(r1.s(k).c, 16);
         src := r1res(k).src;
-        v.s(k).act := r1.s(k).act;
-        v.s(k).pos := r1.s(k).pos;
-        v.s(k).c := r1.s(k).c;
-        v.s(k).l := r1.s(k).l;
+        cb := resize(r1.s(k).pos, 7) + resize(r1.s(k).c, 7);
+        lb := cb + resize(r1.s(k).l, 7);
+        dist := r1.p0 - src;
+        rb := cb;
+        case r1res(k).rk is
+          when RK_ST =>
+            -- Copy bytes whose source is at or after p0 - 32.
+            if dist <= 32 then
+              rb := resize(r1.s(k).pos, 7);
+            elsif dist <= 64 then
+              rb := resize(r1.s(k).pos, 7) + resize(dist(6 downto 0) - 32, 7);
+            end if;
+          when RK_REP =>
+            rb := resize(r1.s(k).pos, 7);
+          when others =>
+            null;
+        end case;
+        if r1.s(k).act = '1' then
+          v.s(k).rb := sat6(rb);
+          v.s(k).cb := sat6(cb);
+          v.s(k).lb := sat6(lb);
+        else
+          v.s(k).rb := to_unsigned(63, 6);
+          v.s(k).cb := to_unsigned(63, 6);
+          v.s(k).lb := to_unsigned(63, 6);
+        end if;
         v.s(k).rk := r1res(k).rk;
         v.s(k).rsl := r1res(k).rsl;
         v.s(k).rot := src(4 downto 0) - o(4 downto 0);
@@ -326,17 +458,25 @@ begin
         line := src(15 downto 5);
         v.s(k).pid1 := pid_of(line, r1);
         v.s(k).pid2 := pid_of(line + 1, r1);
-        dist := r1.p0 - src;
-        if dist > 64 then
-          v.s(k).dist := (others => '1');
-        else
-          v.s(k).dist := dist(6 downto 0);
-        end if;
-        v.s(k).off := r1res(k).per;
-        v.s(k).sh := r1res(k).sh;
         v.s(k).qlane := r1.s(k).q(4 downto 0);
         v.s(k).qline := r1.s(k).q(9 downto 5);
         v.s(k).lrot := r1.s(k).q(4 downto 0) - ol(4 downto 0);
+        if r1res(k).rk = RK_REP then
+          -- Replicated period per before the group: byte at
+          -- p0l - per + ((x - p0l - pos + sh) mod per).
+          v.s(k).ia := r1res(k).sh - r1.p0(4 downto 0) - r1.s(k).pos(4 downto 0);
+          v.s(k).ib := r1.p0(4 downto 0) - r1res(k).per;
+          v.s(k).im := r1res(k).per - 1;
+        else
+          v.s(k).ia := src(4 downto 0) - o(4 downto 0);
+          v.s(k).ib := (others => '0');
+          v.s(k).im := (others => '1');
+        end if;
+        if r1res(k).rk = RK_STRIDE then
+          v.s(k).strf := '1';
+        else
+          v.s(k).strf := '0';
+        end if;
       end loop;
       r2 <= v;
       r2_valid <= r1.valid;
@@ -352,9 +492,16 @@ begin
   s1b_proc: process (clk) is
     variable v     : s1b_type;
     variable rr    : unsigned(5 downto 0);
-    variable cend  : unsigned(5 downto 0);
-    variable lend  : unsigned(5 downto 0);
-    variable rel   : unsigned(5 downto 0);
+    variable tr    : std_logic_vector(0 to QK-1);
+    variable tc    : std_logic_vector(0 to QK-1);
+    variable tl    : std_logic_vector(0 to QK-1);
+    variable s1    : std_logic;
+    variable s0    : std_logic;
+    variable sl    : integer range 0 to QK-1;
+    variable lit   : std_logic;
+    variable rc    : std_logic;
+    variable h     : std_logic;
+    variable pt    : unsigned(1 downto 0);
     variable found : boolean;
     variable cand  : boolean;
   begin
@@ -368,22 +515,31 @@ begin
 
       -- Per-slot source addressing (indexed by source lane).
       for k in 0 to QK-1 loop
-        v.rk(k) := r2.s(k).rk;
-        v.rsl(k) := r2.s(k).rsl;
-        v.rot(k) := r2.s(k).rot;
-        v.lrot(k) := r2.s(k).lrot;
+        v.rot(k) := r2.s(k).rot(3 downto 0);
+        v.lrot(k) := r2.s(k).lrot(3 downto 0);
         for ly in 0 to QB-1 loop
           if ly < r2.s(k).srcl then
             v.st_a(k)(ly) := r2.s(k).sline + 1;
-            v.lt_p(k)(ly) := r2.s(k).pid2;
+            pt := r2.s(k).pid2;
           else
             v.st_a(k)(ly) := r2.s(k).sline;
-            v.lt_p(k)(ly) := r2.s(k).pid1;
+            pt := r2.s(k).pid1;
           end if;
           if ly < r2.s(k).qlane then
             v.li_a(k)(ly) := r2.s(k).qline + 1;
           else
             v.li_a(k)(ly) := r2.s(k).qline;
+          end if;
+          v.sc(k)(ly) := "000";
+          if r2.s(k).rk = RK_LT then
+            if k = 0 then
+              -- Slot 0 always gets port B (0 or 2) of a bank.
+              v.sc(k)(ly) := '0' & pt(1) & not pt(1);
+            else
+              v.sc(k)(ly) := resize(pt, 3) + 1;
+            end if;
+          elsif r2.s(k).rk = RK_LIT and k > 0 then
+            v.sc(k)(ly) := resize(r2.s(k).rsl, 3) + 5;
           end if;
         end loop;
       end loop;
@@ -396,50 +552,50 @@ begin
         else
           v.ing(x) := '0';
         end if;
-        v.own(x) := "000";
-        v.rec(x) := '0';
-        v.idx(x) := (others => '0');
-        v.str(x) := '0';
-        v.slw(x) := '0';
-        v.sone(x) := (others => '0');
         for k in 0 to QK-1 loop
-          cend := r2.s(k).pos + r2.s(k).c;
-          lend := cend + r2.s(k).l;
-          if r2.s(k).act = '1' and rr >= r2.s(k).pos and rr < cend then
-            v.own(x) := to_unsigned(k, 2) & '0';
-            rel := rr - r2.s(k).pos;
-            v.idx(x) := to_unsigned(x, 5) + r2.s(k).rot;
-            case r2.s(k).rk is
-              when RK_ST =>
-                if resize(r2.s(k).dist, 8) <= resize(rel, 8) + 32 then
-                  v.rec(x) := '1';
-                end if;
-              when RK_REP =>
-                v.rec(x) := '1';
-                v.idx(x) := r2.p0l - r2.s(k).off + ((rel(4 downto 0) + r2.s(k).sh) and (r2.s(k).off - 1));
-              when RK_STRIDE =>
-                v.str(x) := '1';
-              when others =>
-                null;
-            end case;
-          elsif r2.s(k).act = '1' and rr >= cend and rr < lend then
-            v.own(x) := to_unsigned(k, 2) & '1';
-          end if;
+          if rr >= r2.s(k).rb then tr(k) := '1'; else tr(k) := '0'; end if;
+          if rr >= r2.s(k).cb then tc(k) := '1'; else tc(k) := '0'; end if;
+          if rr >= r2.s(k).lb then tl(k) := '1'; else tl(k) := '0'; end if;
         end loop;
+        -- Owner slot: number of literal ends passed (they are ordered).
+        s1 := tl(1);
+        s0 := (tl(0) and not tl(1)) or tl(2);
+        sl := to_integer(unsigned'(s1 & s0));
+        lit := '0';
+        rc := '0';
+        for k in 0 to QK-1 loop
+          lit := lit or (tc(k) and not tl(k));
+          rc := rc or (tr(k) and not tc(k));
+        end loop;
+        if lit = '1' then
+          h := r2.s(sl).lrot(4);
+        else
+          h := r2.s(sl).rot(4);
+        end if;
+        v.own(x) := to_unsigned(sl, 2) & lit & h;
+        v.str(x) := r2.s(sl).strf and not lit;
+        v.idx(x) := ((to_unsigned(x, 5) + r2.s(sl).ia) and r2.s(sl).im) + r2.s(sl).ib;
+        v.rec(x) := rc;
 
         -- Stride source: first predecessor at distance j*d (d = 4 or 8,
         -- i.e. 4*i) that is not a stride byte of this group; before the
         -- group -> recent register.
+        v.sdi(x) := "000";
         found := false;
         for i in 1 to 8 loop
           cand := r2.d8 = '0' or i mod 2 = 0;
           if cand and not found then
             if rr < 4 * i then
-              v.slw(x) := '1';
-              v.sone(x)(i) := '1';
+              -- Source before the group: read through the recent-register
+              -- index instead of the stride select.
+              if v.str(x) = '1' then
+                v.rec(x) := '1';
+                v.idx(x) := to_unsigned((x - 4 * i) mod QB, 5);
+                v.str(x) := '0';
+              end if;
               found := true;
             elsif r2.strl((x - 4 * i) mod QB) = '0' then
-              v.sone(x)(i) := '1';
+              v.sdi(x) := to_unsigned(i - 1, 3);
               found := true;
             end if;
           end if;
@@ -482,45 +638,31 @@ begin
   -----------------------------------------------------------------------------
   -- S2a: source select, rotators, merge.
   -----------------------------------------------------------------------------
+  merge_inst: entity work.vhsnunzip_quad_merge
+    port map (
+      clk   => clk,
+      sc    => r3.sc,
+      rot   => r3.rot,
+      lrot  => r3.lrot,
+      own   => r3.own,
+      st_rd => st_rd,
+      lb_rd => lb_rd,
+      lt    => lt_rdat,
+      m     => r4m
+    );
+
   s2a_proc: process (clk) is
-    variable sv    : byte_array(0 to QB-1);
-    variable rc    : byte_matrix(0 to QK-1);
-    variable rl    : byte_matrix(0 to QK-1);
-    variable v     : s2a_type;
   begin
     if rising_edge(clk) then
-      for k in 0 to QK-1 loop
-        for ly in 0 to QB-1 loop
-          case r3.rk(k) is
-            when RK_LT =>
-              sv(ly) := lt_rdat(to_integer(r3.lt_p(k)(ly)))(ly);
-            when RK_LIT =>
-              sv(ly) := lb_rd(to_integer(r3.rsl(k)))(ly);
-            when others =>
-              sv(ly) := st_rd(k)(ly);
-          end case;
-        end loop;
-        rc(k) := rotl(sv, r3.rot(k));
-        rl(k) := rotl(lb_rd(k), r3.lrot(k));
-      end loop;
-      for x in 0 to QB-1 loop
-        if r3.own(x)(0) = '0' then
-          v.m(x) := rc(to_integer(r3.own(x)(2 downto 1)))(x);
-        else
-          v.m(x) := rl(to_integer(r3.own(x)(2 downto 1)))(x);
-        end if;
-      end loop;
-      v.p0l := r3.p0l;
-      v.n := r3.n;
-      v.last := r3.last;
-      v.line0 := r3.line0;
-      v.ing := r3.ing;
-      v.rec := r3.rec;
-      v.idx := r3.idx;
-      v.str := r3.str;
-      v.slw := r3.slw;
-      v.sone := r3.sone;
-      r4 <= v;
+      r4.p0l <= r3.p0l;
+      r4.n <= r3.n;
+      r4.last <= r3.last;
+      r4.line0 <= r3.line0;
+      r4.ing <= r3.ing;
+      r4.rec <= r3.rec;
+      r4.idx <= r3.idx;
+      r4.str <= r3.str;
+      r4.sdi <= r3.sdi;
       r4_valid <= r3_valid;
       if r3_valid = '1' then
         cons_pos <= r3.lnext;
@@ -535,33 +677,23 @@ begin
   -----------------------------------------------------------------------------
   -- S2b: recent/stride fill, history write, output.
   -----------------------------------------------------------------------------
-  s2b_comb_proc: process (r4, r4_valid, lw) is
+  s2b_comb_proc: process (r4, r4m, r4_valid, lw) is
     variable base : byte_array(0 to QB-1);
-    variable sl   : std_logic_vector(7 downto 0);
-    variable sb   : std_logic_vector(7 downto 0);
+    variable sc8  : byte_array(0 to 7);
   begin
     for x in 0 to QB-1 loop
       if r4.rec(x) = '1' then
         base(x) := lw(to_integer(r4.idx(x)));
       else
-        base(x) := r4.m(x);
+        base(x) := r4m(x);
       end if;
     end loop;
     for x in 0 to QB-1 loop
-      sl := X"00";
-      sb := X"00";
       for i in 1 to 8 loop
-        if r4.sone(x)(i) = '1' then
-          sl := sl or lw((x - 4 * i) mod QB);
-          sb := sb or base((x - 4 * i) mod QB);
-        end if;
+        sc8(i - 1) := base((x - 4 * i) mod QB);
       end loop;
       if r4.str(x) = '1' then
-        if r4.slw(x) = '1' then
-          fin(x) <= sl;
-        else
-          fin(x) <= sb;
-        end if;
+        fin(x) <= sc8(to_integer(r4.sdi(x)));
       else
         fin(x) <= base(x);
       end if;
@@ -574,27 +706,27 @@ begin
     end loop;
   end process;
 
+  -- The output line register serves both the output stream and the long-term
+  -- memory. Bytes past the group end are don't-care (out_cnt limits them).
+  -- A flush line (pend) always comes in a bubble cycle: the group former
+  -- leaves one after the last group of a chunk.
   s2b_reg_proc: process (clk) is
     variable pe    : unsigned(6 downto 0);
     variable full  : std_logic;
-    variable oline : byte_array(0 to QB-1);
-    variable part  : byte_array(0 to QB-1);
     variable nlw   : byte_array(0 to QB-1);
   begin
     if rising_edge(clk) then
       pe := resize(r4.p0l, 7) + resize(r4.n, 7);
       if pe >= 32 then full := '1'; else full := '0'; end if;
       for x in 0 to QB-1 loop
-        if to_unsigned(x, 5) >= r4.p0l then
-          oline(x) := fin(x);
+        if pend = '1' or to_unsigned(x, 5) < r4.p0l then
+          oline(x) <= lw(x);
         else
-          oline(x) := lw(x);
+          oline(x) <= fin(x);
         end if;
         if r4.ing(x) = '1' then
-          part(x) := fin(x);
           nlw(x) := fin(x);
         else
-          part(x) := lw(x);
           nlw(x) := lw(x);
         end if;
       end loop;
@@ -603,19 +735,16 @@ begin
       end if;
 
       ln_valid <= r4_valid and full;
-      ln_data <= oline;
       ln_line <= r4.line0;
 
       out_valid <= '0';
       out_last <= '0';
       out_cnt <= to_unsigned(QB, QI+1);
-      out_data <= oline;
       pend <= '0';
       if pend = '1' then
         out_valid <= '1';
         out_last <= '1';
         out_cnt <= pend_cnt;
-        out_data <= lw;
       elsif r4_valid = '1' then
         if r4.last = '1' then
           out_valid <= '1';
@@ -629,7 +758,6 @@ begin
           else
             out_last <= '1';
             out_cnt <= resize(pe, QI+1);
-            out_data <= part;
           end if;
         elsif full = '1' then
           out_valid <= '1';
@@ -643,5 +771,17 @@ begin
       end if;
     end if;
   end process;
+
+  ln_data <= oline;
+  out_data <= oline;
+
+  -- pragma translate_off
+  chk_proc: process (clk) is
+  begin
+    if rising_edge(clk) then
+      assert not (pend = '1' and r4_valid = '1') report "group during flush line" severity failure;
+    end if;
+  end process;
+  -- pragma translate_on
 
 end behavior;
