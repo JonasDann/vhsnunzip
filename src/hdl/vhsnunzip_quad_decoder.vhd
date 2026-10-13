@@ -83,16 +83,13 @@ architecture behavior of vhsnunzip_quad_decoder is
     endm  : std_logic;              -- end-of-chunk marker
     sz4   : unsigned(3 downto 0);   -- size when small
     hend  : unsigned(5 downto 0);   -- end of the header, relative to the line
-    -- End of the element relative to the line, bt = bta + btc + btci (the
-    -- header end plus the literal length; summed in a DSP slice).
-    bta   : unsigned(16 downto 0);
-    btc   : unsigned(5 downto 0);
-    btci  : std_logic;
+    bt    : unsigned(17 downto 0);  -- end of the element (hend + literal
+                                    -- length), relative to the line
   end record;
 
   constant PENT_ZERO : pent_type := (
     ok => '0', sm => '0', endm => '0', sz4 => (others => '0'), hend => (others => '0'),
-    bta => (others => '0'), btc => (others => '0'), btci => '0');
+    bt => (others => '0'));
 
   type pent_array is array (natural range <>) of pent_type;
 
@@ -232,9 +229,6 @@ architecture behavior of vhsnunzip_quad_decoder is
     variable lh     : int_array(0 to 39);
     type u17_array is array (natural range <>) of unsigned(16 downto 0);
     variable lm1    : u17_array(0 to 39);
-    variable lmz    : u17_array(0 to 36);
-    variable hz     : u4_arr(0 to 36);
-    variable litz   : std_logic_vector(0 to 36);
     variable lacc   : unsigned(16 downto 0);
     variable fld    : unsigned(5 downto 0);
     variable nb     : integer range 0 to 4;
@@ -291,18 +285,6 @@ architecture behavior of vhsnunzip_quad_decoder is
         lm1(i) := lacc;
       end if;
     end loop;
-    -- The same, zero unless a literal header starts there within the chunk.
-    for i in 0 to 36 loop
-      if islit(i) = '1' and i < e then
-        litz(i) := '1';
-        lmz(i) := lm1(i);
-        hz(i) := to_unsigned(lh(i), 4);
-      else
-        litz(i) := '0';
-        lmz(i) := (others => '0');
-        hz(i) := (others => '0');
-      end if;
-    end loop;
 
     -- Elements (positions 32 .. 43: lookahead into the next line).
     for j in 0 to 43 loop
@@ -352,14 +334,17 @@ architecture behavior of vhsnunzip_quad_decoder is
         r.e(j).sm := sm;
         r.e(j).endm := endm;
         r.e(j).sz4 := sz4;
-        -- (The element end of an end marker is never used.)
-        hend := m + to_integer(hz(m));
-        r.e(j).bta := lmz(m);
-        r.e(j).btc := to_unsigned(hend, 6);
-        r.e(j).btci := litz(m);
+        if haslit = '1' then
+          hend := m + lh(m);
+          r.e(j).bt := to_unsigned(hend, 18) + resize(lm1(m), 18) + 1;
+        else
+          hend := m;
+          r.e(j).bt := to_unsigned(hend, 18);
+        end if;
         r.e(j).hend := to_unsigned(hend, 6);
         if endm = '1' then
           r.e(j).hend := to_unsigned(j, 6);
+          r.e(j).bt := to_unsigned(j, 18);
         end if;
       else
         r.la(j - QB).ok := ok;
@@ -391,9 +376,7 @@ architecture behavior of vhsnunzip_quad_decoder is
   -- the walk handles it). The element after it is in the window if it starts in
   -- the first two lines (wl = 0) or in the same line (wl = 1); an end marker
   -- there must be at most at the start of the second window line.
-  type u18_arr is array (natural range <>) of unsigned(17 downto 0);
-
-  function line_walk(t : ptab_type; bt : u18_arr; lt32 : std_logic_vector) return wline_type is
+  function line_walk(t : ptab_type) return wline_type is
     variable okx  : std_logic_vector(0 to 43);
     variable smx  : std_logic_vector(0 to 43);
     variable enx  : std_logic_vector(0 to 43);
@@ -417,8 +400,12 @@ architecture behavior of vhsnunzip_quad_decoder is
     for j in 0 to QB-1 loop
       r.t(j).step := stx(j);
       r.t(j).s2 := stx(j);
-      r.t(j).bt := bt(j);
-      r.t(j).btge := not lt32(j);
+      r.t(j).bt := t.e(j).bt;
+      if t.e(j).bt(17 downto 5) /= 0 then
+        r.t(j).btge := '1';
+      else
+        r.t(j).btge := '0';
+      end if;
       -- The element after this one (if this one is small).
       fok := "00";
       fsm := '0';
@@ -490,10 +477,7 @@ architecture behavior of vhsnunzip_quad_decoder is
   -- Input pipeline.
   signal x1, x2   : line_type := LINE_ZERO;
   signal x1v, x2v : std_logic := '0';
-  signal pt_d     : ptab_type;
   signal pt       : ptab_type;
-  signal pt_bt    : u18_arr(0 to QB-1);
-  signal pt_lt32  : std_logic_vector(0 to QB-1);
   signal ptv      : std_logic := '0';
   signal lc_next  : unsigned(14 downto 0) := (others => '0');
   signal wpos     : unsigned(19 downto 0) := (others => '0');
@@ -631,7 +615,7 @@ begin
   begin
     if rising_edge(clk) then
       if mvq = '1' then
-        wf(to_integer(m3(hp, to_integer(qcnt)))) <= line_walk(pt, pt_bt, pt_lt32);
+        wf(to_integer(m3(hp, to_integer(qcnt)))) <= line_walk(pt);
       end if;
     end if;
   end process;
@@ -645,27 +629,11 @@ begin
   lb_data <= cs_data;
   lb_wpos <= wpos;
 
-  pt_d <= line_table(x2, x1, x1v and not x2.last);
-
-  -- Element ends (DSP slices; the P register is part of pt).
-  bt_gen: for j in 0 to QB-1 generate
-    bt_inst: entity work.vhsnunzip_quad_dadd
-      port map (
-        clk   => clk,
-        ce    => mv2,
-        a     => pt_d.e(j).bta,
-        c     => pt_d.e(j).btc,
-        ci    => pt_d.e(j).btci,
-        p     => pt_bt(j),
-        lt32  => pt_lt32(j)
-      );
-  end generate;
-
   in_proc: process (clk) is
   begin
     if rising_edge(clk) then
       if mv2 = '1' then
-        pt <= pt_d;
+        pt <= line_table(x2, x1, x1v and not x2.last);
         ptv <= '1';
       elsif mvq = '1' then
         ptv <= '0';
