@@ -77,6 +77,7 @@ package vhsnunzip_quad_pkg is
     l     : unsigned(5 downto 0);   -- literal piece length (0..32)
     ck    : std_logic_vector(2 downto 0);
     off   : unsigned(15 downto 0);
+    src   : unsigned(15 downto 0);  -- copy source (start - off)
     q     : unsigned(15 downto 0);  -- compressed position of the literal piece
     lt    : std_logic;              -- copy source in long-term memory (CK_HIST only)
     csrj  : unsigned(1 downto 0);   -- CSR: slot containing the source
@@ -85,7 +86,7 @@ package vhsnunzip_quad_pkg is
 
   constant QSLOT_ZERO : qslot_type := (
     act => '0', pos => (others => '0'), c => (others => '0'), l => (others => '0'),
-    ck => CK_NONE, off => (others => '0'), q => (others => '0'), lt => '0',
+    ck => CK_NONE, off => (others => '0'), src => (others => '0'), q => (others => '0'), lt => '0',
     csrj => (others => '0'), csrl => '0');
 
   type qslot_array is array (natural range <>) of qslot_type;
@@ -193,9 +194,10 @@ package vhsnunzip_quad_pkg is
       ln_data     : out byte_array(0 to QB-1);
       ln_line     : out unsigned(10 downto 0);
       out_valid   : out std_logic;
-      out_data    : out byte_array(0 to QB-1);
-      out_cnt     : out unsigned(QI downto 0);
-      out_last    : out std_logic
+      out_pvalid  : out std_logic;
+      out_pdata   : out byte_array(0 to QB-1);
+      out_pcnt    : out unsigned(QI downto 0);
+      out_plast   : out std_logic
     );
   end component;
 

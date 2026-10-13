@@ -69,13 +69,12 @@ architecture behavior of vhsnunzip_quad_decoder is
     data  : byte_array(0 to QB-1);
     last  : std_logic;
     endi  : unsigned(QI-1 downto 0);
-    first : std_logic;
     lc    : unsigned(14 downto 0);
   end record;
 
   constant LINE_ZERO : line_type := (
     data => (others => X"00"), last => '0', endi => (others => '0'),
-    first => '0', lc => (others => '0'));
+    lc => (others => '0'));
 
   -- Line table entry: element starting at this byte of the line.
   type pent_type is record
@@ -83,17 +82,17 @@ architecture behavior of vhsnunzip_quad_decoder is
     sm    : std_logic;              -- small
     endm  : std_logic;              -- end-of-chunk marker
     sz4   : unsigned(3 downto 0);   -- size when small
-    cp    : unsigned(6 downto 0);
-    off   : unsigned(15 downto 0);
     hend  : unsigned(5 downto 0);   -- end of the header, relative to the line
-    bt    : unsigned(17 downto 0);  -- end of the element (hend + literal
-                                    -- length), relative to the line
+    -- End of the element relative to the line, bt = bta + btc + btci (the
+    -- header end plus the literal length; summed in a DSP slice).
+    bta   : unsigned(16 downto 0);
+    btc   : unsigned(5 downto 0);
+    btci  : std_logic;
   end record;
 
   constant PENT_ZERO : pent_type := (
-    ok => '0', sm => '0', endm => '0', sz4 => (others => '0'),
-    cp => (others => '0'), off => (others => '0'), hend => (others => '0'),
-    bt => (others => '0'));
+    ok => '0', sm => '0', endm => '0', sz4 => (others => '0'), hend => (others => '0'),
+    bta => (others => '0'), btc => (others => '0'), btci => '0');
 
   type pent_array is array (natural range <>) of pent_type;
 
@@ -109,6 +108,7 @@ architecture behavior of vhsnunzip_quad_decoder is
 
   type ptab_type is record
     e     : pent_array(0 to QB-1);
+    w     : byte_array(0 to QB+1);      -- the line and two bytes of the next
     la    : lent_array(0 to 11);
     last  : std_logic;
     endi  : unsigned(QI-1 downto 0);
@@ -139,12 +139,51 @@ architecture behavior of vhsnunzip_quad_decoder is
   constant KB_ZERO : kindb_type := ("00", '0', "00");
 
   -- Indexed by the window line the entry is in (0: first, 1: second).
-  type kinda_array is array (0 to 1) of kinda_type;
   type kindb_array is array (0 to 1) of kindb_type;
+
+  -- What the first half of the walk depends on (kinda follows from it after
+  -- the lookup): this element starts here (ok), is small (sm), is an end
+  -- marker (en); the next one is in the window when this one is in window
+  -- line 0 or 1 (fok), small (fsm), an end marker (fen); the start after it
+  -- is an end marker at the end of the line (sp).
+  type kflags_type is record
+    ok    : std_logic;
+    sm    : std_logic;
+    en    : std_logic;
+    fok   : std_logic_vector(0 to 1);
+    fsm   : std_logic;
+    fen   : std_logic;
+    sp    : std_logic;
+  end record;
+
+  constant KF_ZERO : kflags_type := ('0', '0', '0', "00", '0', '0', '0');
+
+  function kinda_of(f : kflags_type; wl : integer range 0 to 1) return kinda_type is
+    variable ok : std_logic;
+  begin
+    ok := f.ok;
+    if wl = 1 and f.en = '1' then
+      ok := '0';
+    end if;
+    if ok = '0' then
+      return KA_ZERO;
+    elsif f.sm = '0' then
+      return ("01", '0', f.en, "01");
+    elsif f.fok(wl) = '0' then
+      return ("01", '0', '0', "10");
+    elsif f.fsm = '0' then
+      return ("10", '0', f.fen, "11");
+    elsif wl = 0 and f.sp = '1' then
+      -- The start after slot 1 is the end marker at the line end.
+      return ("11", '0', '1', "00");
+    else
+      return ("10", '1', '0', "00");
+    end if;
+  end function;
 
   -- Walk table entry. Positions are relative to the entry's line.
   type went_type is record
-    ka    : kinda_array;
+    kf    : kflags_type;
     kb    : kindb_array;
     step  : unsigned(5 downto 0);   -- next element start (if small)
     s2    : unsigned(5 downto 0);   -- start after that one
@@ -153,7 +192,7 @@ architecture behavior of vhsnunzip_quad_decoder is
   end record;
 
   constant WENT_ZERO : went_type := (
-    ka => (others => KA_ZERO), kb => (others => KB_ZERO),
+    kf => KF_ZERO, kb => (others => KB_ZERO),
     step => (others => '0'), s2 => (others => '0'), bt => (others => '0'), btge => '0');
 
   type went_array is array (natural range <>) of went_type;
@@ -167,18 +206,14 @@ architecture behavior of vhsnunzip_quad_decoder is
 
   type wline_array is array (natural range <>) of wline_type;
 
-  -- Fields of the element at a position (the literal length follows from
-  -- the element end in the walk table).
-  type fent_type is record
-    cp    : unsigned(6 downto 0);
-    off   : unsigned(15 downto 0);
-    hend  : unsigned(5 downto 0);
-  end record;
-
-  type fent_array is array (natural range <>) of fent_type;
+  -- What field extraction needs of a line: its bytes (and two of the next
+  -- line) for the copy tag and offset, and per position the header length
+  -- (the literal length follows from the element end in the walk table).
+  type u4_hl_array is array (natural range <>) of unsigned(3 downto 0);
 
   type fline_type is record
-    f     : fent_array(0 to QB-1);
+    w     : byte_array(0 to QB+1);
+    hl    : u4_hl_array(0 to QB-1);
     lc    : unsigned(14 downto 0);
   end record;
 
@@ -197,6 +232,9 @@ architecture behavior of vhsnunzip_quad_decoder is
     variable lh     : int_array(0 to 39);
     type u17_array is array (natural range <>) of unsigned(16 downto 0);
     variable lm1    : u17_array(0 to 39);
+    variable lmz    : u17_array(0 to 36);
+    variable hz     : u4_arr(0 to 36);
+    variable litz   : std_logic_vector(0 to 36);
     variable lacc   : unsigned(16 downto 0);
     variable fld    : unsigned(5 downto 0);
     variable nb     : integer range 0 to 4;
@@ -212,13 +250,12 @@ architecture behavior of vhsnunzip_quad_decoder is
     variable sz4    : unsigned(3 downto 0);
     variable r      : ptab_type;
   begin
+    -- Bytes of the next line are used even when it isn't part of this
+    -- chunk (or not there): only positions past the chunk end see them, and
+    -- their entries are never used.
     for i in 0 to QB-1 loop
       w(i) := x.data(i);
-      if yv = '1' then
-        w(QB + i) := y.data(i);
-      else
-        w(QB + i) := X"00";
-      end if;
+      w(QB + i) := y.data(i);
     end loop;
 
     if x.last = '1' then
@@ -252,6 +289,18 @@ architecture behavior of vhsnunzip_quad_decoder is
           end if;
         end loop;
         lm1(i) := lacc;
+      end if;
+    end loop;
+    -- The same, zero unless a literal header starts there within the chunk.
+    for i in 0 to 36 loop
+      if islit(i) = '1' and i < e then
+        litz(i) := '1';
+        lmz(i) := lm1(i);
+        hz(i) := to_unsigned(lh(i), 4);
+      else
+        litz(i) := '0';
+        lmz(i) := (others => '0');
+        hz(i) := (others => '0');
       end if;
     end loop;
 
@@ -303,30 +352,14 @@ architecture behavior of vhsnunzip_quad_decoder is
         r.e(j).sm := sm;
         r.e(j).endm := endm;
         r.e(j).sz4 := sz4;
-        r.e(j).cp := (others => '0');
-        r.e(j).off := (others => '0');
-        case tag is
-          when "01" =>
-            r.e(j).cp := resize(unsigned(w(j)(4 downto 2)), 7) + 4;
-            r.e(j).off := "00000" & unsigned(w(j)(7 downto 5)) & unsigned(w(j + 1));
-          when "10" | "11" =>
-            r.e(j).cp := resize(unsigned(w(j)(7 downto 2)), 7) + 1;
-            r.e(j).off := unsigned(w(j + 2)) & unsigned(w(j + 1));
-          when others =>
-            null;
-        end case;
-        if haslit = '1' then
-          hend := m + lh(m);
-          r.e(j).bt := to_unsigned(hend, 18) + resize(lm1(m), 18) + 1;
-        else
-          hend := m;
-          r.e(j).bt := to_unsigned(hend, 18);
-        end if;
+        -- (The element end of an end marker is never used.)
+        hend := m + to_integer(hz(m));
+        r.e(j).bta := lmz(m);
+        r.e(j).btc := to_unsigned(hend, 6);
+        r.e(j).btci := litz(m);
         r.e(j).hend := to_unsigned(hend, 6);
         if endm = '1' then
-          r.e(j).cp := (others => '0');
           r.e(j).hend := to_unsigned(j, 6);
-          r.e(j).bt := to_unsigned(j, 18);
         end if;
       else
         r.la(j - QB).ok := ok;
@@ -339,6 +372,7 @@ architecture behavior of vhsnunzip_quad_decoder is
       end if;
     end loop;
 
+    r.w := w(0 to QB+1);
     r.last := x.last;
     r.endi := x.endi;
     r.lc := x.lc;
@@ -357,7 +391,9 @@ architecture behavior of vhsnunzip_quad_decoder is
   -- the walk handles it). The element after it is in the window if it starts in
   -- the first two lines (wl = 0) or in the same line (wl = 1); an end marker
   -- there must be at most at the start of the second window line.
-  function line_walk(t : ptab_type) return wline_type is
+  type u18_arr is array (natural range <>) of unsigned(17 downto 0);
+
+  function line_walk(t : ptab_type; bt : u18_arr; lt32 : std_logic_vector) return wline_type is
     variable okx  : std_logic_vector(0 to 43);
     variable smx  : std_logic_vector(0 to 43);
     variable enx  : std_logic_vector(0 to 43);
@@ -367,7 +403,6 @@ architecture behavior of vhsnunzip_quad_decoder is
     variable fok  : std_logic_vector(0 to 1);
     variable fsm  : std_logic;
     variable fen  : std_logic;
-    variable ka   : kinda_type;
     variable kb   : kindb_type;
     variable r    : wline_type;
   begin
@@ -382,12 +417,8 @@ architecture behavior of vhsnunzip_quad_decoder is
     for j in 0 to QB-1 loop
       r.t(j).step := stx(j);
       r.t(j).s2 := stx(j);
-      r.t(j).bt := t.e(j).bt;
-      if t.e(j).bt(17 downto 5) /= 0 then
-        r.t(j).btge := '1';
-      else
-        r.t(j).btge := '0';
-      end if;
+      r.t(j).bt := bt(j);
+      r.t(j).btge := not lt32(j);
       -- The element after this one (if this one is small).
       fok := "00";
       fsm := '0';
@@ -407,24 +438,18 @@ architecture behavior of vhsnunzip_quad_decoder is
       end loop;
       ok(0) := okx(j);
       ok(1) := okx(j) and not enx(j);
+      r.t(j).kf.ok := okx(j);
+      r.t(j).kf.sm := smx(j);
+      r.t(j).kf.en := enx(j);
+      r.t(j).kf.fok := fok;
+      r.t(j).kf.fsm := fsm;
+      r.t(j).kf.fen := fen;
+      if r.t(j).s2 = QB and okx(QB) = '1' and enx(QB) = '1' then
+        r.t(j).kf.sp := '1';
+      else
+        r.t(j).kf.sp := '0';
+      end if;
       for wl in 0 to 1 loop
-        -- Slots 0, 1 starting here.
-        ka := KA_ZERO;
-        if ok(wl) = '0' then
-          null;
-        elsif smx(j) = '0' then
-          ka := ("01", '0', enx(j), "01");
-        elsif fok(wl) = '0' then
-          ka := ("01", '0', '0', "10");
-        elsif fsm = '0' then
-          ka := ("10", '0', fen, "11");
-        elsif wl = 0 and r.t(j).s2 = QB and okx(QB) = '1' and enx(QB) = '1' then
-          -- The start after slot 1 is the end marker at the line end.
-          ka := ("11", '0', '1', "00");
-        else
-          ka := ("10", '1', '0', "00");
-        end if;
-        r.t(j).ka(wl) := ka;
         -- Slots 2, 3 starting here.
         kb := KB_ZERO;
         if ok(wl) = '0' or (smx(j) = '0' and enx(j) = '0') then
@@ -454,10 +479,9 @@ architecture behavior of vhsnunzip_quad_decoder is
   function line_fields(t : ptab_type) return fline_type is
     variable r : fline_type;
   begin
+    r.w := t.w;
     for j in 0 to QB-1 loop
-      r.f(j).cp := t.e(j).cp;
-      r.f(j).off := t.e(j).off;
-      r.f(j).hend := t.e(j).hend;
+      r.hl(j) := resize(t.e(j).hend - j, 4);
     end loop;
     r.lc := t.lc;
     return r;
@@ -466,10 +490,12 @@ architecture behavior of vhsnunzip_quad_decoder is
   -- Input pipeline.
   signal x1, x2   : line_type := LINE_ZERO;
   signal x1v, x2v : std_logic := '0';
+  signal pt_d     : ptab_type;
   signal pt       : ptab_type;
+  signal pt_bt    : u18_arr(0 to QB-1);
+  signal pt_lt32  : std_logic_vector(0 to QB-1);
   signal ptv      : std_logic := '0';
   signal lc_next  : unsigned(14 downto 0) := (others => '0');
-  signal prev_last: std_logic := '1';
   signal wpos     : unsigned(19 downto 0) := (others => '0');
   signal pop      : std_logic;
   signal mv1, mv2 : std_logic;
@@ -478,17 +504,64 @@ architecture behavior of vhsnunzip_quad_decoder is
   -- Line file: walk tables of the queued lines hp .. hp+qcnt-1 (line n in
   -- slot n mod 3), read directly by the walk; registers written with a clock
   -- enable, so the only logic is the lookup multiplexers. The fields go to a
-  -- queue with the same slots. The window is lines hp + lag + (0, 1) (lag =
-  -- 1: the window advanced last cycle; the head moves this cycle).
+  -- queue with the same slots in block RAM, one copy per window line, whose
+  -- output registers are the field extraction's line registers. The window
+  -- is lines hp + lag + (0, 1) (lag = 1: the window advanced last cycle; the
+  -- head moves this cycle).
   signal wf       : wline_array(0 to 2);
-  signal qf       : fline_array(0 to 2);
   signal hp       : unsigned(1 downto 0) := "00";
   signal qcnt     : unsigned(1 downto 0) := "00";
   signal lag      : std_logic := '0';
-  signal win_f    : fline_array(0 to 1);
+
+  -- Field queue copies: window line 0 needs bytes 0 .. 31, the header
+  -- lengths and the line number; window line 1 bytes 0 .. 33 and the header
+  -- lengths.
+  constant FM0_BITS : natural := 8*QB + 4*QB + 15;
+  constant FM1_BITS : natural := 8*(QB+2) + 4*QB;
+  type fm0_type is array (0 to 3) of std_logic_vector(FM0_BITS-1 downto 0);
+  type fm1_type is array (0 to 3) of std_logic_vector(FM1_BITS-1 downto 0);
+  signal fm0      : fm0_type;
+  signal fm1      : fm1_type;
+  signal fq0      : std_logic_vector(FM0_BITS-1 downto 0);
+  signal fq1      : std_logic_vector(FM1_BITS-1 downto 0);
+
+  function fm_pack(f : fline_type; nb : natural; wlc : boolean) return std_logic_vector is
+    variable v : std_logic_vector(8*nb + 4*QB + 15 - 1 downto 0);
+  begin
+    for i in 0 to nb-1 loop
+      v(8*i+7 downto 8*i) := f.w(i);
+    end loop;
+    for i in 0 to QB-1 loop
+      v(8*nb+4*i+3 downto 8*nb+4*i) := std_logic_vector(f.hl(i));
+    end loop;
+    v(8*nb+4*QB+14 downto 8*nb+4*QB) := std_logic_vector(f.lc);
+    if wlc then
+      return v;
+    else
+      return v(8*nb+4*QB-1 downto 0);
+    end if;
+  end function;
+
+  function fm_unpack(v : std_logic_vector; nb : natural; wlc : boolean) return fline_type is
+    variable f : fline_type;
+  begin
+    f.w := (others => X"00");
+    for i in 0 to nb-1 loop
+      f.w(i) := v(8*i+7 downto 8*i);
+    end loop;
+    for i in 0 to QB-1 loop
+      f.hl(i) := unsigned(v(8*nb+4*i+3 downto 8*nb+4*i));
+    end loop;
+    f.lc := (others => '0');
+    if wlc then
+      f.lc := unsigned(v(8*nb+4*QB+14 downto 8*nb+4*QB));
+    end if;
+    return f;
+  end function;
 
   attribute ram_style : string;
   attribute ram_style of wf : signal is "registers";
+  attribute ram_style of fm0, fm1 : signal is "block";
 
   -- Next element start: rel_raw + 32 * (radd - rsh) relative to the start of
   -- line hp (rel_raw + 32 * radd is relative to the line before the last
@@ -517,8 +590,10 @@ architecture behavior of vhsnunzip_quad_decoder is
   signal fx_sh    : std_logic := '0';
   signal fx_base  : unsigned(14 downto 0) := (others => '0');
   signal fx_q     : fline_array(0 to 1);
-  signal fx_bt0   : unsigned(17 downto 0);
-  signal fx_bt1   : unsigned(17 downto 0);
+  signal fx_btb   : unsigned(17 downto 0);   -- end of the big element
+  signal fx_big   : std_logic_vector(0 to 1); -- slot 0 / slot 1 is big
+  signal fx_en0   : unsigned(5 downto 0);
+  signal fx_en1   : unsigned(5 downto 0);
   signal fx_en2   : unsigned(5 downto 0);
   signal fx_en3   : unsigned(5 downto 0);
 
@@ -529,9 +604,22 @@ begin
   -- table -> queue. All movement decisions depend only on registered state.
   -----------------------------------------------------------------------------
   -- Fields of the window lines, for the field extraction next cycle.
-  qf_gen: for i in 0 to 1 generate
-    win_f(i) <= qf(to_integer(m3(hp, to_integer(unsigned'("" & lag)) + i)));
-  end generate;
+  fm_proc: process (clk) is
+    variable wa : integer range 0 to 3;
+  begin
+    if rising_edge(clk) then
+      wa := to_integer(m3(hp, to_integer(qcnt)));
+      if mvq = '1' then
+        fm0(wa) <= fm_pack(line_fields(pt), QB, true);
+        fm1(wa) <= fm_pack(line_fields(pt), QB+2, false);
+      end if;
+      fq0 <= fm0(to_integer(m3(hp, to_integer(unsigned'("" & lag)))));
+      fq1 <= fm1(to_integer(m3(hp, to_integer(unsigned'("" & lag)) + 1)));
+    end if;
+  end process;
+  fx_q(0) <= fm_unpack(fq0, QB, true);
+  fx_q(1) <= fm_unpack(fq1, QB+2, false);
+  fx_base <= fx_q(0).lc;
 
   -- A full file takes a new line when the head moves (its slot is free).
   mvq <= ptv when qcnt /= 3 or lag = '1' else '0';
@@ -543,8 +631,7 @@ begin
   begin
     if rising_edge(clk) then
       if mvq = '1' then
-        wf(to_integer(m3(hp, to_integer(qcnt)))) <= line_walk(pt);
-        qf(to_integer(m3(hp, to_integer(qcnt)))) <= line_fields(pt);
+        wf(to_integer(m3(hp, to_integer(qcnt)))) <= line_walk(pt, pt_bt, pt_lt32);
       end if;
     end if;
   end process;
@@ -558,11 +645,27 @@ begin
   lb_data <= cs_data;
   lb_wpos <= wpos;
 
+  pt_d <= line_table(x2, x1, x1v and not x2.last);
+
+  -- Element ends (DSP slices; the P register is part of pt).
+  bt_gen: for j in 0 to QB-1 generate
+    bt_inst: entity work.vhsnunzip_quad_dadd
+      port map (
+        clk   => clk,
+        ce    => mv2,
+        a     => pt_d.e(j).bta,
+        c     => pt_d.e(j).btc,
+        ci    => pt_d.e(j).btci,
+        p     => pt_bt(j),
+        lt32  => pt_lt32(j)
+      );
+  end generate;
+
   in_proc: process (clk) is
   begin
     if rising_edge(clk) then
       if mv2 = '1' then
-        pt <= line_table(x2, x1, x1v and not x2.last);
+        pt <= pt_d;
         ptv <= '1';
       elsif mvq = '1' then
         ptv <= '0';
@@ -577,10 +680,8 @@ begin
         x1.data <= cs_data;
         x1.last <= cs_last;
         x1.endi <= cs_endi;
-        x1.first <= prev_last;
         x1.lc <= lc_next;
         x1v <= '1';
-        prev_last <= cs_last;
         lc_next <= lc_next + 1;
         wpos <= (lc_next + 1) & "00000";
       elsif mv1 = '1' then
@@ -590,7 +691,6 @@ begin
         x1v <= '0';
         x2v <= '0';
         ptv <= '0';
-        prev_last <= '1';
         lc_next <= (others => '0');
         wpos <= (others => '0');
       end if;
@@ -612,7 +712,9 @@ begin
     variable vlf, vls   : unsigned(2 downto 0);
     variable e0, e1, e2 : unsigned(6 downto 0);
     variable e3, e4     : unsigned(6 downto 0);
-    variable ta, tb, t1 : went_type;
+    variable ta, tb, tg : went_type;
+    variable sg         : unsigned(1 downto 0);
+    variable pg         : unsigned(4 downto 0);
     variable ka         : kinda_type;
     variable kb         : kindb_type;
     variable rn         : unsigned(17 downto 0);
@@ -674,7 +776,7 @@ begin
       e0 := l0 & rel_raw(4 downto 0);
       if l0(0) = lag then w0 := 0; else w0 := 1; end if;
       ta := wf(to_integer(s0)).t(to_integer(rel_raw(4 downto 0)));
-      ka := ta.ka(w0);
+      ka := kinda_of(ta.kf, w0);
       -- The end marker of a chunk that ends exactly at the end of the first
       -- window line is at the start of the second (whose table may not exist).
       if w0 = 1 and rel_raw(4 downto 0) = 0 and ezf = '1' then
@@ -695,7 +797,16 @@ begin
       end if;
       e3 := tpos(l2, tb.step);
       e4 := tpos(l2, tb.s2);
-      t1 := wf(to_integer(s1)).t(to_integer(ta.step(4 downto 0)));
+      -- The end of the big element of the cycle (at most one: slot 0 if it
+      -- isn't small, otherwise slot 1).
+      if ta.kf.sm = '0' then
+        sg := s0;
+        pg := rel_raw(4 downto 0);
+      else
+        sg := s1;
+        pg := ta.step(4 downto 0);
+      end if;
+      tg := wf(to_integer(sg)).t(to_integer(pg));
 
       -- Next start, and whether it is past the first window line (ge).
       ra := "00";
@@ -704,10 +815,10 @@ begin
         endc := ka.endc;
         case ka.sel is
           when "00" => rn := relc; ge := rge;
-          when "01" => rn := ta.bt; ra := l0; ge := ta.btge or to_unsigned(w0, 1)(0);
+          when "01" => rn := tg.bt; ra := l0; ge := tg.btge or to_unsigned(w0, 1)(0);
           when "10" => rn := resize(e1, 18); ge := ge7(e1, lg);
           when others =>
-            rn := t1.bt; ra := l1; ge := t1.btge;
+            rn := tg.bt; ra := l1; ge := tg.btge;
             if l1(0) /= lag then
               ge := '1';
             end if;
@@ -737,10 +848,11 @@ begin
       fx_cnt <= cnt;
       fx_endc <= endc;
       fx_sh <= lag;
-      fx_base <= win_f(0).lc;
-      fx_q <= win_f;
-      fx_bt0 <= ta.bt;
-      fx_bt1 <= t1.bt;
+      fx_btb <= tg.bt;
+      fx_big(0) <= not ta.kf.sm;
+      fx_big(1) <= not ta.kf.fsm;
+      fx_en0 <= ta.step;
+      fx_en1 <= ta.s2;
       fx_en2 <= tb.step;
       fx_en3 <= tb.s2;
 
@@ -809,35 +921,61 @@ begin
   -- start in the two window lines. The literal length is the element end
   -- minus the header end (slots 2 and 3 only hold small elements).
   fx_proc: process (clk) is
-    variable pe   : fent_type;
+    variable wb   : byte_array(0 to 2*QB+1);
+    variable wh   : u4_hl_array(0 to 2*QB-1);
+    variable b0   : std_logic_vector(7 downto 0);
+    variable b1   : std_logic_vector(7 downto 0);
+    variable b2   : std_logic_vector(7 downto 0);
+    variable hend : unsigned(5 downto 0);
     variable wl   : std_logic;
     variable wp   : unsigned(5 downto 0);
     variable base : unsigned(19 downto 0);
-    variable en   : unsigned(17 downto 0);
     variable li   : unsigned(17 downto 0);
   begin
     if rising_edge(clk) then
       base := fx_base & "00000";
+      wb := fx_q(0).w(0 to QB-1) & fx_q(1).w;
+      wh := fx_q(0).hl & fx_q(1).hl;
       for k in 0 to QK-1 loop
         -- Position relative to the window.
         wp := fx_e(k)(5 downto 0);
         wp(5) := fx_e(k)(5) xor fx_sh;
         wl := wp(5);
-        if wl = '0' then
-          pe := fx_q(0).f(to_integer(wp(4 downto 0)));
-        else
-          pe := fx_q(1).f(to_integer(wp(4 downto 0)));
-        end if;
+        b0 := wb(to_integer(wp));
+        b1 := wb(to_integer(wp) + 1);
+        b2 := wb(to_integer(wp) + 2);
+        hend := resize(wp(4 downto 0), 6) + wh(to_integer(wp));
         case k is
-          when 0 => li := fx_bt0 - resize(pe.hend, 18);
-          when 1 => li := fx_bt1 - resize(pe.hend, 18);
-          when 2 => li := resize((fx_en2 - pe.hend) and "001111", 18);
-          when others => li := resize((fx_en3 - pe.hend) and "001111", 18);
+          -- Small elements are at most 12 bytes, so their literal length
+          -- follows modulo 16 from the next start (in any line).
+          when 0 =>
+            if fx_big(0) = '1' then
+              li := fx_btb - resize(hend, 18);
+            else
+              li := resize((fx_en0 - hend) and "001111", 18);
+            end if;
+          when 1 =>
+            if fx_big(1) = '1' then
+              li := fx_btb - resize(hend, 18);
+            else
+              li := resize((fx_en1 - hend) and "001111", 18);
+            end if;
+          when 2 => li := resize((fx_en2 - hend) and "001111", 18);
+          when others => li := resize((fx_en3 - hend) and "001111", 18);
         end case;
-        el(k).cp <= pe.cp;
-        el(k).off <= pe.off;
+        case b0(1 downto 0) is
+          when "01" =>
+            el(k).cp <= resize(unsigned(b0(4 downto 2)), 7) + 4;
+            el(k).off <= "00000" & unsigned(b0(7 downto 5)) & unsigned(b1);
+          when "10" | "11" =>
+            el(k).cp <= resize(unsigned(b0(7 downto 2)), 7) + 1;
+            el(k).off <= unsigned(b2) & unsigned(b1);
+          when others =>
+            el(k).cp <= (others => '0');
+            el(k).off <= (others => '0');
+        end case;
         el(k).li <= li(16 downto 0);
-        el(k).q <= base + resize(wl & "00000", 20) + resize(pe.hend, 20);
+        el(k).q <= base + resize(wl & "00000", 20) + resize(hend, 20);
         el(k).last <= '0';
         el(k).tot <= (others => '0');
         el(k).pw2 <= '0';

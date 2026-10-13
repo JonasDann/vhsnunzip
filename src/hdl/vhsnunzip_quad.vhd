@@ -32,8 +32,11 @@ end vhsnunzip_quad;
 
 architecture behavior of vhsnunzip_quad is
 
-  signal co_bytes   : byte_array(0 to QB-1);
-  signal co_ctrl    : std_logic_vector(QI downto 0);
+  -- FIFO entries: control bits, then the line (byte i at bits 8i ..).
+  constant COW      : natural := 8*QB + QI + 1;
+  constant DEW      : natural := 8*QB + QI + 2;
+  signal co_word    : std_logic_vector(COW-1 downto 0);
+  signal cs_word    : std_logic_vector(COW-1 downto 0);
   signal cs_valid   : std_logic;
   signal cs_ready   : std_logic;
   signal cs_data    : byte_array(0 to QB-1);
@@ -59,42 +62,41 @@ architecture behavior of vhsnunzip_quad is
   signal ln_line    : unsigned(10 downto 0);
 
   signal out_valid  : std_logic;
-  signal out_data   : byte_array(0 to QB-1);
-  signal out_cnt    : unsigned(QI downto 0);
-  signal out_last   : std_logic;
-  signal out_ctrl   : std_logic_vector(QI+1 downto 0);
-  signal de_bytes   : byte_array(0 to QB-1);
+  signal out_pvalid : std_logic;
+  signal out_pdata  : byte_array(0 to QB-1);
+  signal out_pcnt   : unsigned(QI downto 0);
+  signal out_plast  : std_logic;
+  signal out_pword  : std_logic_vector(DEW-1 downto 0);
+  signal de_word    : std_logic_vector(DEW-1 downto 0);
   signal de_ctrl    : std_logic_vector(QI+1 downto 0);
   signal de_level   : unsigned(5 downto 0);
 
 begin
 
-  co_proc: process (co_data, co_cnt, co_last) is
-  begin
-    for i in 0 to QB-1 loop
-      co_bytes(i) <= co_data(8*i+7 downto 8*i);
-    end loop;
-    co_ctrl(0) <= co_last;
-    co_ctrl(QI downto 1) <= std_logic_vector(unsigned(co_cnt) - 1);
-  end process;
+  co_word <= std_logic_vector(unsigned(co_cnt) - 1) & co_last & co_data;
 
-  co_fifo_inst: vhsnunzip_fifo
+  co_fifo_inst: entity work.vhsnunzip_quad_ififo
     generic map (
-      DATA_WIDTH  => QB,
-      CTRL_WIDTH  => QI+1
+      W           => COW
     )
     port map (
       clk         => clk,
       reset       => reset,
       wr_valid    => co_valid,
       wr_ready    => co_ready,
-      wr_data     => co_bytes,
-      wr_ctrl     => co_ctrl,
+      wr_data     => co_word,
       rd_valid    => cs_valid,
       rd_ready    => cs_ready,
-      rd_data     => cs_data,
-      rd_ctrl     => cs_ctrl
+      rd_data     => cs_word
     );
+
+  cs_proc: process (cs_word) is
+  begin
+    for i in 0 to QB-1 loop
+      cs_data(i) <= cs_word(8*i+7 downto 8*i);
+    end loop;
+    cs_ctrl <= cs_word(COW-1 downto 8*QB);
+  end process;
 
   decoder_inst: vhsnunzip_quad_decoder
     port map (
@@ -142,9 +144,10 @@ begin
       ln_data     => ln_data,
       ln_line     => ln_line,
       out_valid   => out_valid,
-      out_data    => out_data,
-      out_cnt     => out_cnt,
-      out_last    => out_last
+      out_pvalid  => out_pvalid,
+      out_pdata   => out_pdata,
+      out_pcnt    => out_pcnt,
+      out_plast   => out_plast
     );
 
   lt_mem_inst: vhsnunzip_quad_lt_mem
@@ -160,24 +163,28 @@ begin
       wq_resv     => wq_resv
     );
 
-  out_ctrl(0) <= out_last;
-  out_ctrl(QI+1 downto 1) <= std_logic_vector(out_cnt);
+  out_proc: process (out_pdata, out_pcnt, out_plast) is
+  begin
+    for i in 0 to QB-1 loop
+      out_pword(8*i+7 downto 8*i) <= out_pdata(i);
+    end loop;
+    out_pword(8*QB) <= out_plast;
+    out_pword(DEW-1 downto 8*QB+1) <= std_logic_vector(out_pcnt);
+  end process;
 
-  de_fifo_inst: vhsnunzip_fifo
+  de_fifo_inst: entity work.vhsnunzip_quad_ofifo
     generic map (
-      DATA_WIDTH  => QB,
-      CTRL_WIDTH  => QI+2
+      W           => DEW
     )
     port map (
       clk         => clk,
       reset       => reset,
+      pw_valid    => out_pvalid,
+      pw_data     => out_pword,
       wr_valid    => out_valid,
-      wr_data     => out_data,
-      wr_ctrl     => out_ctrl,
       rd_valid    => de_valid,
       rd_ready    => de_ready,
-      rd_data     => de_bytes,
-      rd_ctrl     => de_ctrl,
+      rd_data     => de_word,
       level       => de_level
     );
 
@@ -198,11 +205,11 @@ begin
     end if;
   end process;
 
-  de_proc: process (de_bytes, de_ctrl) is
+  de_data <= de_word(8*QB-1 downto 0);
+  de_ctrl <= de_word(DEW-1 downto 8*QB);
+
+  de_proc: process (de_ctrl) is
   begin
-    for i in 0 to QB-1 loop
-      de_data(8*i+7 downto 8*i) <= de_bytes(i);
-    end loop;
     de_cnt <= de_ctrl(QI+1 downto 1);
     if unsigned(de_ctrl(QI+1 downto 1)) /= 0 then
       de_dvalid <= '1';
