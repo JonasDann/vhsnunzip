@@ -33,44 +33,72 @@ end vhsnunzip_quad_lt_mem;
 
 architecture behavior of vhsnunzip_quad_lt_mem is
   constant WQ_LOG2 : natural := 4;
-  type wq_mem_type is array (0 to 2**WQ_LOG2-1) of std_logic_vector(265 downto 0);
-  type uv_array is array (natural range <>) of std_logic_vector(255 downto 0);
+  type wq_mem_type is array (0 to 2**WQ_LOG2-1) of std_logic_vector(255 downto 0);
+  type wa_mem_type is array (0 to 2**WQ_LOG2-1) of std_logic_vector(9 downto 0);
 begin
 
+  -- Each write queue keeps its lines in block RAM and their addresses in
+  -- LUTRAM. The block RAM read takes a cycle, so a line can be drained from
+  -- the second cycle after it was queued on (one cycle later than with an
+  -- asynchronous read, when the queue was empty). The reservation follows a
+  -- shadow count that drains as soon as possible, so the group former sees
+  -- the same reservations as with an asynchronous queue; the real queue
+  -- holds at most one line more than the shadow count.
   bank_gen: for b in 0 to 1 generate
     signal wq      : wq_mem_type;
+    signal wa      : wa_mem_type;
     signal wptr    : unsigned(WQ_LOG2 downto 0) := (others => '0');
     signal rptr    : unsigned(WQ_LOG2 downto 0) := (others => '0');
-    signal cnt     : unsigned(WQ_LOG2 downto 0);
-    signal head    : std_logic_vector(265 downto 0);
+    signal sptr    : unsigned(WQ_LOG2 downto 0) := (others => '0');
+    signal rcnt    : unsigned(WQ_LOG2 downto 0) := (others => '0');
+    signal scnt    : unsigned(WQ_LOG2 downto 0);
+    signal wr_en   : std_logic;
+    signal wr_d    : std_logic := '0';
+    signal ra      : unsigned(WQ_LOG2-1 downto 0);
+    signal head    : std_logic_vector(255 downto 0);
     signal drain   : std_logic;
     signal a_en    : std_logic;
     signal a_addr  : unsigned(9 downto 0);
-    signal din     : std_logic_vector(255 downto 0);
     signal a_dout  : std_logic_vector(255 downto 0);
     signal b_dout  : std_logic_vector(255 downto 0);
+    attribute ram_style : string;
+    attribute ram_style of wq : signal is "block";
   begin
 
-    cnt <= wptr - rptr;
-    head <= wq(to_integer(rptr(WQ_LOG2-1 downto 0)));
-    drain <= '1' when cnt /= 0 and rd_v(2*b+1) = '0' else '0';
+    wr_en <= wr_valid when wr_line(0) = to_unsigned(b, 1)(0) else '0';
+    scnt <= wptr - sptr;
+    -- rcnt: queued lines that were written before the last clock edge.
+    drain <= '1' when rcnt /= 0 and rd_v(2*b+1) = '0' else '0';
+    ra <= rptr(WQ_LOG2-1 downto 0) + 1 when drain = '1' else rptr(WQ_LOG2-1 downto 0);
 
     wq_proc: process (clk) is
-      variable wd : std_logic_vector(265 downto 0);
+      variable wd : std_logic_vector(255 downto 0);
+      variable rc : unsigned(WQ_LOG2 downto 0);
     begin
       if rising_edge(clk) then
-        if wr_valid = '1' and wr_line(0) = to_unsigned(b, 1)(0) then
+        if wr_en = '1' then
           for i in 0 to QB-1 loop
             wd(8*i+7 downto 8*i) := wr_data(i);
           end loop;
-          wd(265 downto 256) := std_logic_vector(wr_line(10 downto 1));
           wq(to_integer(wptr(WQ_LOG2-1 downto 0))) <= wd;
+          wa(to_integer(wptr(WQ_LOG2-1 downto 0))) <= std_logic_vector(wr_line(10 downto 1));
           wptr <= wptr + 1;
         end if;
+        head <= wq(to_integer(ra));
+        wr_d <= wr_en;
+        rc := rcnt;
         if drain = '1' then
           rptr <= rptr + 1;
+          rc := rc - 1;
         end if;
-        if cnt >= 8 then
+        if wr_d = '1' then
+          rc := rc + 1;
+        end if;
+        rcnt <= rc;
+        if scnt /= 0 and rd_v(2*b+1) = '0' then
+          sptr <= sptr + 1;
+        end if;
+        if scnt >= 8 then
           wq_resv(b) <= '1';
         else
           wq_resv(b) <= '0';
@@ -78,13 +106,16 @@ begin
         if reset = '1' then
           wptr <= (others => '0');
           rptr <= (others => '0');
+          sptr <= (others => '0');
+          rcnt <= (others => '0');
+          wr_d <= '0';
           wq_resv(b) <= '0';
         end if;
       end if;
     end process;
 
     a_en <= rd_v(2*b+1) or drain;
-    a_addr <= rd_a(2*b+1) when rd_v(2*b+1) = '1' else unsigned(head(265 downto 256));
+    a_addr <= rd_a(2*b+1) when rd_v(2*b+1) = '1' else unsigned(wa(to_integer(rptr(WQ_LOG2-1 downto 0))));
 
     ram_inst: entity work.vhsnunzip_quad_uram
       port map (
@@ -92,7 +123,7 @@ begin
         a_en    => a_en,
         a_we    => drain,
         a_addr  => a_addr,
-        a_din   => head(255 downto 0),
+        a_din   => head,
         a_dout  => a_dout,
         b_en    => rd_v(2*b),
         b_addr  => rd_a(2*b),
@@ -106,6 +137,15 @@ begin
         rdat(2*b+1)(i) <= a_dout(8*i+7 downto 8*i);
       end loop;
     end process;
+
+    -- pragma translate_off
+    chk_proc: process (clk) is
+    begin
+      if rising_edge(clk) then
+        assert wptr - rptr <= 2**WQ_LOG2 - 1 report "long-term write queue overflow" severity failure;
+      end if;
+    end process;
+    -- pragma translate_on
 
   end generate;
 

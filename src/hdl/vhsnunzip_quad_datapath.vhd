@@ -187,10 +187,13 @@ architecture behavior of vhsnunzip_quad_datapath is
     mq    : std_logic_vector(0 to QB-1);
     sca   : unsigned(2 downto 0);
     scb   : unsigned(2 downto 0);
-    -- Recent-register index of a copy byte at output lane x: x + ia, or for
-    -- a replicated piece ((x + ia) and im) + ib with the group's period.
+    -- Recent-register index of a copy byte at output lane x:
+    -- ((x + ia) and im) + ib. Plain copies: x + rot. Replicated pieces:
+    -- p0l - per + ((x - p0l - pos + sh) mod per). Stride pieces (used for
+    -- bytes whose stride source is before the group): p0l - d + (rr mod d).
     ia    : unsigned(4 downto 0);
-    repf  : std_logic;
+    im    : unsigned(4 downto 0);
+    ib    : unsigned(4 downto 0);
     strf  : std_logic;
   end record;
   type s1a_slot_array is array (natural range <>) of s1a_slot_type;
@@ -203,10 +206,7 @@ architecture behavior of vhsnunzip_quad_datapath is
     line0 : unsigned(10 downto 0);
     lnext : unsigned(15 downto 0);
     d8    : std_logic;
-    -- Replicated pieces all repeat slot 0's period per: ib = p0 - per, im = per - 1.
-    ib    : unsigned(4 downto 0);
-    im    : unsigned(4 downto 0);
-    strl  : std_logic_vector(0 to QB-1);  -- lane is in a stride piece
+    rr    : u5_array(0 to QB-1);          -- lane relative to the group start
     s     : s1a_slot_array(0 to QK-1);
   end record;
   signal r2       : s1a_type;
@@ -409,7 +409,6 @@ begin
     variable src   : unsigned(15 downto 0);
     variable dist  : unsigned(15 downto 0);
     variable line  : unsigned(10 downto 0);
-    variable rr    : unsigned(5 downto 0);
     variable cb    : unsigned(6 downto 0);
     variable lb    : unsigned(6 downto 0);
     variable rb    : unsigned(6 downto 0);
@@ -425,22 +424,13 @@ begin
       v.line0 := r1.p0(15 downto 5);
       v.lnext := r1.lnext;
       v.d8 := '0';
-      v.ib := r1.p0(4 downto 0) - r1res(0).per;
-      v.im := r1res(0).per - 1;
       for k in QK-1 downto 0 loop
         if r1res(k).rk = RK_STRIDE and r1.s(k).off(3) = '1' then
           v.d8 := '1';
         end if;
       end loop;
-      -- Stride piece membership by lane.
       for x in 0 to QB-1 loop
-        rr := resize(to_unsigned(x, 5) - r1.p0(4 downto 0), 6);
-        v.strl(x) := '0';
-        for k in 0 to QK-1 loop
-          if r1res(k).rk = RK_STRIDE and rr >= r1.s(k).pos and rr < r1.s(k).pos + r1.s(k).c then
-            v.strl(x) := '1';
-          end if;
-        end loop;
+        v.rr(x) := to_unsigned(x, 5) - r1.p0(4 downto 0);
       end loop;
       for k in 0 to QK-1 loop
         o := r1.p0 + resize(r1.s(k).pos, 16);
@@ -502,19 +492,21 @@ begin
           v.s(k).scb := resize(r1res(k).rsl, 3) + 5;
         end if;
         v.s(k).lrot := r1.s(k).q(4 downto 0) - ol(4 downto 0);
+        v.s(k).ia := src(4 downto 0) - o(4 downto 0);
+        v.s(k).im := (others => '1');
+        v.s(k).ib := (others => '0');
+        v.s(k).strf := '0';
         if r1res(k).rk = RK_REP then
-          -- Replicated period per before the group: byte at
-          -- p0l - per + ((x - p0l - pos + sh) mod per).
+          -- Replicated period per before the group.
           v.s(k).ia := r1res(k).sh - r1.p0(4 downto 0) - r1.s(k).pos(4 downto 0);
-          v.s(k).repf := '1';
-        else
-          v.s(k).ia := src(4 downto 0) - o(4 downto 0);
-          v.s(k).repf := '0';
-        end if;
-        if r1res(k).rk = RK_STRIDE then
+          v.s(k).im := r1res(k).per - 1;
+          v.s(k).ib := r1.p0(4 downto 0) - r1res(k).per;
+        elsif r1res(k).rk = RK_STRIDE then
+          -- Stride d = 4 or 8, source before the group.
+          v.s(k).ia := 0 - r1.p0(4 downto 0);
+          v.s(k).im := "00" & r1.s(k).off(3) & "11";
+          v.s(k).ib := r1.p0(4 downto 0) - resize(r1.s(k).off(3 downto 0), 5);
           v.s(k).strf := '1';
-        else
-          v.s(k).strf := '0';
         end if;
       end loop;
       r2 <= v;
@@ -530,7 +522,10 @@ begin
   -----------------------------------------------------------------------------
   s1b_proc: process (clk) is
     variable v     : s1b_type;
-    variable rr    : unsigned(5 downto 0);
+    variable rr    : unsigned(4 downto 0);
+    variable strl  : std_logic_vector(0 to QB-1);
+    variable rcl   : std_logic_vector(0 to QB-1);
+    variable before: std_logic;
     variable tr    : std_logic_vector(0 to QK-1);
     variable tc    : std_logic_vector(0 to QK-1);
     variable tl    : std_logic_vector(0 to QK-1);
@@ -571,9 +566,9 @@ begin
         end loop;
       end loop;
 
-      -- Per output lane.
+      -- Per output lane: owner slot, piece kind, recent-register index.
       for x in 0 to QB-1 loop
-        rr := resize(to_unsigned(x, 5) - r2.p0l, 6);
+        rr := r2.rr(x);
         if rr < r2.n then
           v.ing(x) := '1';
         else
@@ -590,6 +585,8 @@ begin
         sl := to_integer(unsigned'(s1 & s0));
         lit := '0';
         rc := '0';
+        -- (Lanes past the group are don't-care, so slot 3 needs no end.)
+        tl(QK-1) := '0';
         for k in 0 to QK-1 loop
           lit := lit or (tc(k) and not tl(k));
           rc := rc or (tr(k) and not tc(k));
@@ -600,37 +597,34 @@ begin
           h := r2.s(sl).rot(4);
         end if;
         v.own(x) := to_unsigned(sl, 2) & lit & h;
-        v.str(x) := r2.s(sl).strf and not lit;
-        if r2.s(sl).repf = '1' then
-          v.idx(x) := ((to_unsigned(x, 5) + r2.s(sl).ia) and r2.im) + r2.ib;
-        else
-          v.idx(x) := to_unsigned(x, 5) + r2.s(sl).ia;
-        end if;
-        v.rec(x) := rc;
+        strl(x) := r2.s(sl).strf and not lit;
+        v.idx(x) := ((to_unsigned(x, 5) + r2.s(sl).ia) and r2.s(sl).im) + r2.s(sl).ib;
+        rcl(x) := rc;
+      end loop;
 
-        -- Stride source: first predecessor at distance j*d (d = 4 or 8,
-        -- i.e. 4*i) that is not a stride byte of this group; before the
-        -- group -> recent register.
+      -- Stride source: first predecessor at distance j*d (d = 4 or 8, i.e.
+      -- 4*i) that is not a stride byte of this group; if there is none
+      -- before the group start, the byte comes from the recent register
+      -- (the index above).
+      for x in 0 to QB-1 loop
+        rr := r2.rr(x);
         v.sdi(x) := "000";
+        before := '0';
         found := false;
         for i in 1 to 8 loop
           cand := r2.d8 = '0' or i mod 2 = 0;
           if cand and not found then
             if rr < 4 * i then
-              -- Source before the group: read through the recent-register
-              -- index instead of the stride select.
-              if v.str(x) = '1' then
-                v.rec(x) := '1';
-                v.idx(x) := to_unsigned((x - 4 * i) mod QB, 5);
-                v.str(x) := '0';
-              end if;
+              before := '1';
               found := true;
-            elsif r2.strl((x - 4 * i) mod QB) = '0' then
+            elsif strl((x - 4 * i) mod QB) = '0' then
               v.sdi(x) := to_unsigned(i - 1, 3);
               found := true;
             end if;
           end if;
         end loop;
+        v.rec(x) := rcl(x) or (strl(x) and before);
+        v.str(x) := strl(x) and not before;
       end loop;
 
       r3 <= v;

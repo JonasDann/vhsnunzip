@@ -69,12 +69,10 @@ architecture behavior of vhsnunzip_quad_decoder is
     data  : byte_array(0 to QB-1);
     last  : std_logic;
     endi  : unsigned(QI-1 downto 0);
-    lc    : unsigned(14 downto 0);
   end record;
 
   constant LINE_ZERO : line_type := (
-    data => (others => X"00"), last => '0', endi => (others => '0'),
-    lc => (others => '0'));
+    data => (others => X"00"), last => '0', endi => (others => '0'));
 
   -- Line table entry: element starting at this byte of the line.
   type pent_type is record
@@ -109,7 +107,6 @@ architecture behavior of vhsnunzip_quad_decoder is
     la    : lent_array(0 to 11);
     last  : std_logic;
     endi  : unsigned(QI-1 downto 0);
-    lc    : unsigned(14 downto 0);
     vlen  : unsigned(2 downto 0);   -- varint length if the line starts a chunk
   end record;
 
@@ -211,10 +208,7 @@ architecture behavior of vhsnunzip_quad_decoder is
   type fline_type is record
     w     : byte_array(0 to QB+1);
     hl    : u4_hl_array(0 to QB-1);
-    lc    : unsigned(14 downto 0);
   end record;
-
-  type fline_array is array (natural range <>) of fline_type;
 
   type u6_arr is array (natural range <>) of unsigned(5 downto 0);
   type u4_arr is array (natural range <>) of unsigned(3 downto 0);
@@ -360,7 +354,6 @@ architecture behavior of vhsnunzip_quad_decoder is
     r.w := w(0 to QB+1);
     r.last := x.last;
     r.endi := x.endi;
-    r.lc := x.lc;
     r.vlen := "101";
     for i in 4 downto 0 loop
       if w(i)(7) = '0' then
@@ -470,7 +463,6 @@ architecture behavior of vhsnunzip_quad_decoder is
     for j in 0 to QB-1 loop
       r.hl(j) := resize(t.e(j).hend - j, 4);
     end loop;
-    r.lc := t.lc;
     return r;
   end function;
 
@@ -487,65 +479,39 @@ architecture behavior of vhsnunzip_quad_decoder is
 
   -- Line file: walk tables of the queued lines hp .. hp+qcnt-1 (line n in
   -- slot n mod 3), read directly by the walk; registers written with a clock
-  -- enable, so the only logic is the lookup multiplexers. The fields go to a
-  -- queue with the same slots in block RAM, one copy per window line, whose
-  -- output registers are the field extraction's line registers. The window
-  -- is lines hp + lag + (0, 1) (lag = 1: the window advanced last cycle; the
-  -- head moves this cycle).
+  -- enable, so the only logic is the lookup multiplexers. The fields go to
+  -- block RAM (see below). The window is lines hp + lag + (0, 1) (lag = 1:
+  -- the window advanced last cycle; the head moves this cycle).
   signal wf       : wline_array(0 to 2);
   signal hp       : unsigned(1 downto 0) := "00";
   signal qcnt     : unsigned(1 downto 0) := "00";
   signal lag      : std_logic := '0';
 
-  -- Field queue copies: window line 0 needs bytes 0 .. 31, the header
-  -- lengths and the line number; window line 1 bytes 0 .. 33 and the header
-  -- lengths.
-  constant FM0_BITS : natural := 8*QB + 4*QB + 15;
-  constant FM1_BITS : natural := 8*(QB+2) + 4*QB;
-  type fm0_type is array (0 to 3) of std_logic_vector(FM0_BITS-1 downto 0);
-  type fm1_type is array (0 to 3) of std_logic_vector(FM1_BITS-1 downto 0);
-  signal fm0      : fm0_type;
-  signal fm1      : fm1_type;
-  signal fq0      : std_logic_vector(FM0_BITS-1 downto 0);
-  signal fq1      : std_logic_vector(FM1_BITS-1 downto 0);
+  -- Field queue: one copy per slot in block RAM, holding the line's bytes
+  -- (and two of the next line) and header lengths, indexed by the line
+  -- number modulo 8 (qa: that of line hp). Each slot reads the line its
+  -- element starts in, the cycle after the walk.
+  constant FS_BITS : natural := 8*(QB+2) + 4*QB;
+  type fs_mem_type is array (0 to 7) of std_logic_vector(FS_BITS-1 downto 0);
+  type fs_array is array (natural range <>) of std_logic_vector(FS_BITS-1 downto 0);
+  signal fq       : fs_array(0 to QK-1);
+  signal qa       : unsigned(2 downto 0) := "000";
+  signal hlc      : unsigned(14 downto 0) := (others => '0');  -- line number of line hp
 
-  function fm_pack(f : fline_type; nb : natural; wlc : boolean) return std_logic_vector is
-    variable v : std_logic_vector(8*nb + 4*QB + 15 - 1 downto 0);
+  function fs_pack(f : fline_type) return std_logic_vector is
+    variable v : std_logic_vector(FS_BITS-1 downto 0);
   begin
-    for i in 0 to nb-1 loop
+    for i in 0 to QB+1 loop
       v(8*i+7 downto 8*i) := f.w(i);
     end loop;
     for i in 0 to QB-1 loop
-      v(8*nb+4*i+3 downto 8*nb+4*i) := std_logic_vector(f.hl(i));
+      v(8*(QB+2)+4*i+3 downto 8*(QB+2)+4*i) := std_logic_vector(f.hl(i));
     end loop;
-    v(8*nb+4*QB+14 downto 8*nb+4*QB) := std_logic_vector(f.lc);
-    if wlc then
-      return v;
-    else
-      return v(8*nb+4*QB-1 downto 0);
-    end if;
-  end function;
-
-  function fm_unpack(v : std_logic_vector; nb : natural; wlc : boolean) return fline_type is
-    variable f : fline_type;
-  begin
-    f.w := (others => X"00");
-    for i in 0 to nb-1 loop
-      f.w(i) := v(8*i+7 downto 8*i);
-    end loop;
-    for i in 0 to QB-1 loop
-      f.hl(i) := unsigned(v(8*nb+4*i+3 downto 8*nb+4*i));
-    end loop;
-    f.lc := (others => '0');
-    if wlc then
-      f.lc := unsigned(v(8*nb+4*QB+14 downto 8*nb+4*QB));
-    end if;
-    return f;
+    return v;
   end function;
 
   attribute ram_style : string;
   attribute ram_style of wf : signal is "registers";
-  attribute ram_style of fm0, fm1 : signal is "block";
 
   -- Next element start: rel_raw + 32 * (radd - rsh) relative to the start of
   -- line hp (rel_raw + 32 * radd is relative to the line before the last
@@ -563,17 +529,16 @@ architecture behavior of vhsnunzip_quad_decoder is
   signal rsh      : std_logic := '0';
   signal newchunk : std_logic := '1';
 
-  -- Field extraction stage: element starts relative to the line before the
-  -- last head move (fx_sh: whether it moved), the fields of the two window
-  -- lines (which start at the line after the head move), and the element
-  -- ends from the walk (line-relative).
+  -- Field extraction, two stages: element starts relative to line hp
+  -- (whose number is fx_lc and queue index fx_qa), and the element ends
+  -- from the walk (line-relative). The field queue lines are read in the
+  -- first stage and used in the second.
   type u7_arr is array (natural range <>) of unsigned(6 downto 0);
   signal fx_e     : u7_arr(0 to QK-1);
   signal fx_cnt   : unsigned(2 downto 0) := "000";
   signal fx_endc  : std_logic := '0';
-  signal fx_sh    : std_logic := '0';
-  signal fx_base  : unsigned(14 downto 0) := (others => '0');
-  signal fx_q     : fline_array(0 to 1);
+  signal fx_qa    : unsigned(2 downto 0) := "000";
+  signal fx_lc    : unsigned(14 downto 0) := (others => '0');
   signal fx_btb   : unsigned(17 downto 0);   -- end of the big element
   signal fx_big   : std_logic_vector(0 to 1); -- slot 0 / slot 1 is big
   signal fx_en0   : unsigned(5 downto 0);
@@ -581,29 +546,39 @@ architecture behavior of vhsnunzip_quad_decoder is
   signal fx_en2   : unsigned(5 downto 0);
   signal fx_en3   : unsigned(5 downto 0);
 
+  -- The same one cycle later, when the field queue lines are read.
+  signal fz_e     : u7_arr(0 to QK-1);
+  signal fz_cnt   : unsigned(2 downto 0) := "000";
+  signal fz_endc  : std_logic := '0';
+  signal fz_lc    : unsigned(14 downto 0) := (others => '0');
+  signal fz_btb   : unsigned(17 downto 0);
+  signal fz_big   : std_logic_vector(0 to 1);
+  type u6_arr4 is array (0 to QK-1) of unsigned(5 downto 0);
+  signal fz_en    : u6_arr4;
+
 begin
 
   -----------------------------------------------------------------------------
   -- Input pipeline: FIFO -> x1 -> x2 -> (A) line table -> pt -> (B) walk
   -- table -> queue. All movement decisions depend only on registered state.
   -----------------------------------------------------------------------------
-  -- Fields of the window lines, for the field extraction next cycle.
-  fm_proc: process (clk) is
-    variable wa : integer range 0 to 3;
+  -- Field queue copies: written with the walk table, read the cycle after
+  -- the walk at the line of each slot's element.
+  fs_gen: for k in 0 to QK-1 generate
+    signal fs : fs_mem_type;
+    attribute ram_style : string;
+    attribute ram_style of fs : signal is "block";
   begin
-    if rising_edge(clk) then
-      wa := to_integer(m3(hp, to_integer(qcnt)));
-      if mvq = '1' then
-        fm0(wa) <= fm_pack(line_fields(pt), QB, true);
-        fm1(wa) <= fm_pack(line_fields(pt), QB+2, false);
+    fs_proc: process (clk) is
+    begin
+      if rising_edge(clk) then
+        if mvq = '1' then
+          fs(to_integer(qa + resize(qcnt, 3))) <= fs_pack(line_fields(pt));
+        end if;
+        fq(k) <= fs(to_integer(fx_qa + resize(fx_e(k)(6 downto 5), 3)));
       end if;
-      fq0 <= fm0(to_integer(m3(hp, to_integer(unsigned'("" & lag)))));
-      fq1 <= fm1(to_integer(m3(hp, to_integer(unsigned'("" & lag)) + 1)));
-    end if;
-  end process;
-  fx_q(0) <= fm_unpack(fq0, QB, true);
-  fx_q(1) <= fm_unpack(fq1, QB+2, false);
-  fx_base <= fx_q(0).lc;
+    end process;
+  end generate;
 
   -- A full file takes a new line when the head moves (its slot is free).
   mvq <= ptv when qcnt /= 3 or lag = '1' else '0';
@@ -648,7 +623,6 @@ begin
         x1.data <= cs_data;
         x1.last <= cs_last;
         x1.endi <= cs_endi;
-        x1.lc <= lc_next;
         x1v <= '1';
         lc_next <= lc_next + 1;
         wpos <= (lc_next + 1) & "00000";
@@ -815,7 +789,8 @@ begin
       fx_e(3) <= e3;
       fx_cnt <= cnt;
       fx_endc <= endc;
-      fx_sh <= lag;
+      fx_qa <= qa;
+      fx_lc <= hlc;
       fx_btb <= tg.bt;
       fx_big(0) <= not ta.kf.sm;
       fx_big(1) <= not ta.kf.fsm;
@@ -864,6 +839,8 @@ begin
       ncnt := qcnt;
       if lag = '1' then
         hp <= m3(hp, 1);
+        qa <= qa + 1;
+        hlc <= hlc + 1;
         ncnt := ncnt - 1;
       end if;
       if mvq = '1' then
@@ -874,6 +851,8 @@ begin
       if reset = '1' then
         qcnt <= "00";
         hp <= "00";
+        qa <= "000";
+        hlc <= (others => '0');
         kreg <= "00";
         lag <= '0';
         rsh <= '0';
@@ -885,52 +864,55 @@ begin
     end if;
   end process;
 
-  -- Field extraction for the elements emitted in the previous cycle. They
-  -- start in the two window lines. The literal length is the element end
-  -- minus the header end (slots 2 and 3 only hold small elements).
+  -- Field extraction for the elements emitted two cycles before, from the
+  -- line each one starts in. The literal length is the element end minus
+  -- the header end (slots 2 and 3 only hold small elements).
+  fz_proc: process (clk) is
+  begin
+    if rising_edge(clk) then
+      fz_e <= fx_e;
+      fz_cnt <= fx_cnt;
+      fz_endc <= fx_endc;
+      fz_lc <= fx_lc;
+      fz_btb <= fx_btb;
+      fz_big <= fx_big;
+      fz_en <= (fx_en0, fx_en1, fx_en2, fx_en3);
+      if reset = '1' then
+        fz_cnt <= "000";
+      end if;
+    end if;
+  end process;
+
   fx_proc: process (clk) is
-    variable wb   : byte_array(0 to 2*QB+1);
-    variable wh   : u4_hl_array(0 to 2*QB-1);
+    variable f    : fline_type;
     variable b0   : std_logic_vector(7 downto 0);
     variable b1   : std_logic_vector(7 downto 0);
     variable b2   : std_logic_vector(7 downto 0);
+    variable pos  : integer range 0 to QB-1;
     variable hend : unsigned(5 downto 0);
-    variable wl   : std_logic;
-    variable wp   : unsigned(5 downto 0);
     variable base : unsigned(19 downto 0);
     variable li   : unsigned(17 downto 0);
   begin
     if rising_edge(clk) then
-      base := fx_base & "00000";
-      wb := fx_q(0).w(0 to QB-1) & fx_q(1).w;
-      wh := fx_q(0).hl & fx_q(1).hl;
       for k in 0 to QK-1 loop
-        -- Position relative to the window.
-        wp := fx_e(k)(5 downto 0);
-        wp(5) := fx_e(k)(5) xor fx_sh;
-        wl := wp(5);
-        b0 := wb(to_integer(wp));
-        b1 := wb(to_integer(wp) + 1);
-        b2 := wb(to_integer(wp) + 2);
-        hend := resize(wp(4 downto 0), 6) + wh(to_integer(wp));
-        case k is
-          -- Small elements are at most 12 bytes, so their literal length
-          -- follows modulo 16 from the next start (in any line).
-          when 0 =>
-            if fx_big(0) = '1' then
-              li := fx_btb - resize(hend, 18);
-            else
-              li := resize((fx_en0 - hend) and "001111", 18);
-            end if;
-          when 1 =>
-            if fx_big(1) = '1' then
-              li := fx_btb - resize(hend, 18);
-            else
-              li := resize((fx_en1 - hend) and "001111", 18);
-            end if;
-          when 2 => li := resize((fx_en2 - hend) and "001111", 18);
-          when others => li := resize((fx_en3 - hend) and "001111", 18);
-        end case;
+        for i in 0 to QB+1 loop
+          f.w(i) := fq(k)(8*i+7 downto 8*i);
+        end loop;
+        for i in 0 to QB-1 loop
+          f.hl(i) := unsigned(fq(k)(8*(QB+2)+4*i+3 downto 8*(QB+2)+4*i));
+        end loop;
+        pos := to_integer(fz_e(k)(4 downto 0));
+        b0 := f.w(pos);
+        b1 := f.w(pos + 1);
+        b2 := f.w(pos + 2);
+        hend := resize(fz_e(k)(4 downto 0), 6) + f.hl(pos);
+        -- Small elements are at most 12 bytes, so their literal length
+        -- follows modulo 16 from the next start (in any line).
+        if k < 2 and fz_big(k mod 2) = '1' then
+          li := fz_btb - resize(hend, 18);
+        else
+          li := resize((fz_en(k) - hend) and "001111", 18);
+        end if;
         case b0(1 downto 0) is
           when "01" =>
             el(k).cp <= resize(unsigned(b0(4 downto 2)), 7) + 4;
@@ -942,22 +924,23 @@ begin
             el(k).cp <= (others => '0');
             el(k).off <= (others => '0');
         end case;
+        base := (fz_lc + resize(fz_e(k)(6 downto 5), 15)) & "00000";
         el(k).li <= li(16 downto 0);
-        el(k).q <= base + resize(wl & "00000", 20) + resize(hend, 20);
+        el(k).q <= base + resize(hend, 20);
         el(k).last <= '0';
         el(k).tot <= (others => '0');
         el(k).pw2 <= '0';
         el(k).s4 <= '0';
         el(k).s8 <= '0';
-        if fx_endc = '1' and k + 1 = fx_cnt then
+        if fz_endc = '1' and k + 1 = fz_cnt then
           -- An end marker may be at the start of the line after the window.
           el(k).cp <= (others => '0');
           el(k).li <= (others => '0');
-          el(k).q <= base + resize(fx_e(k), 20) - resize(fx_sh & "00000", 20);
+          el(k).q <= (fz_lc & "00000") + resize(fz_e(k), 20);
           el(k).last <= '1';
         end if;
       end loop;
-      el_cnt <= fx_cnt;
+      el_cnt <= fz_cnt;
       if reset = '1' then
         el_cnt <= "000";
       end if;
