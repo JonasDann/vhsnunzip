@@ -11,14 +11,14 @@ use ieee.numeric_std.all;
 --          lane 4 * i before is a stride byte (i = 1 .. 7): q(2 .. 0) =
 --          z - 1 for the first i = z that is not (only even i if d8), q(3):
 --          there is none within the group (z = 0 or z > rr / 4).
---  KIND 2: per-lane memory line for 32 bytes from position a (line a / 32,
---          start lane a mod 32): bits 5*ly+4 .. 5*ly = a / 32 + 1 for the
---          lanes ly before the start lane, a / 32 for the others.
+-- With LOGIC (KIND 1 only), the address is registered instead and the
+-- function computed in logic after it.
 entity vhsnunzip_quad_rom is
   generic (
     KIND        : natural;
     AW          : natural;
-    DW          : natural
+    DW          : natural;
+    LOGIC       : boolean := false
   );
   port (
     clk         : in  std_logic;
@@ -34,25 +34,33 @@ end vhsnunzip_quad_rom;
 architecture behavior of vhsnunzip_quad_rom is
   type rom_type is array (0 to 2**AW-1) of std_logic_vector(DW-1 downto 0);
 
+  function stride_src(a : std_logic_vector(10 downto 0)) return std_logic_vector is
+    variable z : integer range 0 to 7;
+    variable r : std_logic_vector(3 downto 0);
+  begin
+    z := 0;
+    for i in 7 downto 1 loop
+      if a(i - 1) = '0' and (a(10) = '0' or i mod 2 = 0) then
+        z := i;
+      end if;
+    end loop;
+    r(2 downto 0) := std_logic_vector(to_unsigned((z + 7) mod 8, 3));
+    if z = 0 or z > to_integer(unsigned(a(9 downto 7))) then
+      r(3) := '1';
+    else
+      r(3) := '0';
+    end if;
+    return r;
+  end function;
+
   function rom_init return rom_type is
     variable r  : rom_type;
     variable p  : integer;
     variable b  : integer;
-    variable rv : integer;
-    variable z  : integer;
-    variable sv : std_logic_vector(6 downto 0);
   begin
     for a in 0 to 2**AW-1 loop
       r(a) := (others => '0');
-      if KIND = 2 then
-        for ly in 0 to 31 loop
-          if ly < a mod 32 then
-            r(a)(5*ly+4 downto 5*ly) := std_logic_vector(to_unsigned((a / 32 + 1) mod 32, 5));
-          else
-            r(a)(5*ly+4 downto 5*ly) := std_logic_vector(to_unsigned(a / 32, 5));
-          end if;
-        end loop;
-      elsif KIND = 0 then
+      if KIND = 0 then
         p := a / 32;
         b := a mod 32;
         for x in 0 to DW-1 loop
@@ -61,18 +69,7 @@ architecture behavior of vhsnunzip_quad_rom is
           end if;
         end loop;
       else
-        sv := std_logic_vector(to_unsigned(a mod 128, 7));
-        rv := (a / 128) mod 8;
-        z := 0;
-        for i in 7 downto 1 loop
-          if sv(i - 1) = '0' and (a / 1024 = 0 or i mod 2 = 0) then
-            z := i;
-          end if;
-        end loop;
-        r(a)(2 downto 0) := std_logic_vector(to_unsigned((z + 7) mod 8, 3));
-        if z = 0 or z > rv then
-          r(a)(3) := '1';
-        end if;
+        r(a)(3 downto 0) := stride_src(std_logic_vector(to_unsigned(a, 11)));
       end if;
     end loop;
     return r;
@@ -82,21 +79,79 @@ architecture behavior of vhsnunzip_quad_rom is
   attribute rom_style : string;
   attribute rom_style of rom : signal is "block";
 begin
-  rd_proc: process (clk) is
+  rom_gen: if not LOGIC generate
+    rd_proc: process (clk) is
+    begin
+      if rising_edge(clk) then
+        if z0 = '1' then
+          q0 <= (others => '0');
+        else
+          q0 <= rom(to_integer(unsigned(a0)));
+        end if;
+        if z1 = '1' then
+          q1 <= (others => '0');
+        else
+          q1 <= rom(to_integer(unsigned(a1)));
+        end if;
+      end if;
+    end process;
+  end generate;
+
+  logic_gen: if LOGIC generate
+    signal a0_r : std_logic_vector(10 downto 0);
+    signal a1_r : std_logic_vector(10 downto 0);
   begin
-    if rising_edge(clk) then
-      if z0 = '1' then
-        q0 <= (others => '0');
-      else
-        q0 <= rom(to_integer(unsigned(a0)));
+    reg_proc: process (clk) is
+    begin
+      if rising_edge(clk) then
+        a0_r <= a0;
+        a1_r <= a1;
       end if;
-      if z1 = '1' then
-        q1 <= (others => '0');
-      else
-        q1 <= rom(to_integer(unsigned(a1)));
-      end if;
-    end if;
-  end process;
+    end process;
+    q0 <= stride_src(a0_r);
+    q1 <= stride_src(a1_r);
+  end generate;
+end behavior;
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+-- Per-lane memory line for 32 bytes from position a (line a / 32, start
+-- lane a mod 32): bits 5*ly+4 .. 5*ly of q = a / 32 + 1 for the lanes ly
+-- before the start lane, a / 32 for the others, two cycles after a. Eight
+-- lanes per DSP adder: 6-bit fields of the line plus the lane's start
+-- comparison, the top bit of each field taking the carry.
+entity vhsnunzip_quad_lines is
+  port (
+    clk         : in  std_logic;
+    a           : in  std_logic_vector(9 downto 0);
+    q           : out std_logic_vector(159 downto 0)
+  );
+end vhsnunzip_quad_lines;
+
+architecture behavior of vhsnunzip_quad_lines is
+begin
+  add_gen: for d in 0 to 3 generate
+    signal da : std_logic_vector(47 downto 0);
+    signal dc : std_logic_vector(47 downto 0);
+    signal dp : std_logic_vector(47 downto 0);
+  begin
+    field_gen: for j in 0 to 7 generate
+      da(6*j+5 downto 6*j+1) <= (others => '0');
+      da(6*j) <= '1' when 8*d + j < to_integer(unsigned(a(4 downto 0))) else '0';
+      dc(6*j+5) <= '0';
+      dc(6*j+4 downto 6*j) <= a(9 downto 5);
+      q(5*(8*d+j)+4 downto 5*(8*d+j)) <= dp(6*j+4 downto 6*j);
+    end generate;
+    add_inst: entity work.vhsnunzip_quad_add48
+      port map (
+        clk => clk,
+        a   => da,
+        c   => dc,
+        p   => dp
+      );
+  end generate;
 end behavior;
 
 library ieee;
@@ -210,9 +265,9 @@ use work.vhsnunzip_quad_pkg.all;
 --   S2b : recent-history fill (copies from the last 32 bytes, replicated
 --         slot 0), stride fill, short-term write, output line
 --
--- Per-lane decisions that are functions of a few bits (boundary lane masks,
--- memory lines, stride sources) are looked up in block RAM tables
--- (vhsnunzip_quad_rom), which register them like the pipeline registers.
+-- Per-lane boundary lane masks are looked up in block RAM tables
+-- (vhsnunzip_quad_rom), which register them like the pipeline registers;
+-- the per-lane memory lines are DSP adders (vhsnunzip_quad_lines).
 --
 -- History is split in three by age, relative to the group start p0:
 --  - [p0-32, p0): the "recent" register LW, which holds the most recent byte
@@ -280,10 +335,9 @@ architecture behavior of vhsnunzip_quad_datapath is
     rsl   : unsigned(1 downto 0);
     rot   : unsigned(4 downto 0);
     lrot  : unsigned(4 downto 0);
-    -- Source line (the source lanes below the start lane read the next
-    -- one; see the line tables) and the copy source select code for the
-    -- source line and the next.
-    sline : unsigned(4 downto 0);
+    -- Source start lane (the source lanes below it read the next line) and
+    -- the copy source select code for the source line and the next.
+    sst   : unsigned(4 downto 0);
     sca   : unsigned(2 downto 0);
     scb   : unsigned(2 downto 0);
     -- Recent-register index of a copy byte at output lane x: plain copies
@@ -321,13 +375,11 @@ architecture behavior of vhsnunzip_quad_datapath is
     line0 : unsigned(10 downto 0);
     lnext : unsigned(15 downto 0);
     -- per slot: rotation (without bit 4) of the copy and literal sources,
-    -- and per source lane: memory addresses and copy source select
-    -- (0: short-term, 1 .. 4: long-term port, 5 .. 7: literal of slot 0 .. 2;
-    -- slot 0 only uses 0, 1 and 2 = long-term port 2).
+    -- and per source lane: copy source select (0: short-term, 1 .. 4:
+    -- long-term port, 5 .. 7: literal of slot 0 .. 2; slot 0 only uses 0, 1
+    -- and 2 = long-term port 2). The memory addresses are ln_q.
     rot   : u4_array(0 to QK-1);
     lrot  : u4_array(0 to QK-1);
-    st_a  : u5_matrix(0 to QK-1);
-    li_a  : u5_matrix(0 to QK-1);
     sc    : u3_matrix(0 to QK-1);
     -- per output lane: piece select (slot, literal, rotation bit 4)
     own   : u4_array(0 to QB-1);
@@ -368,7 +420,7 @@ architecture behavior of vhsnunzip_quad_datapath is
   signal mk_q     : slv32_array(0 to NM-1);
 
   -- Per-lane memory lines of the copy source (short-term memory) and the
-  -- literal (literal buffer) of each slot (valid in S1b).
+  -- literal (literal buffer) of each slot (valid with R3).
   type slv160_array is array (natural range <>) of std_logic_vector(5*QB-1 downto 0);
   signal ln_q     : slv160_array(0 to 2*QK-1);
 
@@ -593,7 +645,7 @@ begin
       v.s(k).rk := r1res(k).rk;
       v.s(k).rsl := r1res(k).rsl;
       v.s(k).rot := src(4 downto 0) - o(4 downto 0);
-      v.s(k).sline := src(9 downto 5);
+      v.s(k).sst := src(4 downto 0);
       line := src(15 downto 5);
       pid1 := pid_of(line, r1);
       pid2 := pid_of(line + 1, r1);
@@ -667,19 +719,20 @@ begin
     end loop;
   end process;
 
-  -- Memory lines, looked up from the source and literal positions in R1
-  -- (registered in the table like the S1a outputs in R2).
+  -- Memory lines of the source and literal positions in R1 (in DSP adders,
+  -- registered like the S1a and S1b outputs).
   ln_gen: for k in 0 to QK-1 generate
-    rom_inst: entity work.vhsnunzip_quad_rom
-      generic map (KIND => 2, AW => 10, DW => 5*QB)
+    st_inst: entity work.vhsnunzip_quad_lines
       port map (
         clk => clk,
-        a0  => std_logic_vector(r1res(k).src(9 downto 0)),
-        a1  => std_logic_vector(r1.s(k).q(9 downto 0)),
-        z0  => '0',
-        z1  => '0',
-        q0  => ln_q(2*k),
-        q1  => ln_q(2*k+1)
+        a   => std_logic_vector(r1res(k).src(9 downto 0)),
+        q   => ln_q(2*k)
+      );
+    li_inst: entity work.vhsnunzip_quad_lines
+      port map (
+        clk => clk,
+        a   => std_logic_vector(r1.s(k).q(9 downto 0)),
+        q   => ln_q(2*k+1)
       );
   end generate;
 
@@ -700,7 +753,7 @@ begin
   -----------------------------------------------------------------------------
   -- S1b: per-lane control.
   -----------------------------------------------------------------------------
-  s1b_proc: process (r2, mk_q, ln_q) is
+  s1b_proc: process (r2, mk_q) is
     variable v     : s1b_type;
     variable tr    : std_logic_vector(0 to QK-1);
     variable tc    : std_logic_vector(0 to QK-1);
@@ -725,10 +778,8 @@ begin
       v.rot(k) := r2.s(k).rot(3 downto 0);
       v.lrot(k) := r2.s(k).lrot(3 downto 0);
       for ly in 0 to QB-1 loop
-        v.st_a(k)(ly) := unsigned(ln_q(2*k)(5*ly+4 downto 5*ly));
-        v.li_a(k)(ly) := unsigned(ln_q(2*k+1)(5*ly+4 downto 5*ly));
-        -- The lane reads the next line if its line differs in bit 0.
-        if ln_q(2*k)(5*ly) /= r2.s(k).sline(0) then
+        -- The source lanes below the start lane read the next line.
+        if ly < r2.s(k).sst then
           v.sc(k)(ly) := r2.s(k).scb;
         else
           v.sc(k)(ly) := r2.s(k).sca;
@@ -789,7 +840,7 @@ begin
   -- Stride source: first predecessor at distance 4*z (d = 4 or 8; with d = 8
   -- only even z) that is not a stride byte of this group. If it is before
   -- the group start, the byte comes from the recent register (the index
-  -- above). Looked up from the S1b values, registered in the table like R3.
+  -- above). From the S1b values, registered like R3.
   sd_addr: process (s1b_v, r2) is
   begin
     for x in 0 to QB-1 loop
@@ -803,7 +854,7 @@ begin
 
   sd_gen: for i in 0 to QB/2-1 generate
     rom_inst: entity work.vhsnunzip_quad_rom
-      generic map (KIND => 1, AW => 11, DW => 4)
+      generic map (KIND => 1, AW => 11, DW => 4, LOGIC => true)
       port map (
         clk => clk,
         a0  => sd_a(2*i),
@@ -828,7 +879,7 @@ begin
   begin
     port_gen: for p in 0 to 15 generate
       wd(2*p+1 downto 2*p) <= fin(ly)(2*(p mod 4)+1 downto 2*(p mod 4));
-      ra(5*p+4 downto 5*p) <= std_logic_vector(r3.st_a(p / 4)(ly));
+      ra(5*p+4 downto 5*p) <= ln_q(2*(p / 4))(5*ly+4 downto 5*ly);
       st_rd(p / 4)(ly)(2*(p mod 4)+1 downto 2*(p mod 4)) <= rd(2*p+1 downto 2*p);
     end generate;
     stm_inst: entity work.vhsnunzip_quad_lram
@@ -854,7 +905,7 @@ begin
       constant sl : natural := p mod 4;
     begin
       wd(2*p+1 downto 2*p) <= lb_data(ly)(2*sl+1 downto 2*sl);
-      ra(5*p+4 downto 5*p) <= std_logic_vector(r3.li_a(k)(ly));
+      ra(5*p+4 downto 5*p) <= ln_q(2*k+1)(5*ly+4 downto 5*ly);
       lb_rd(k)(ly)(2*sl+1 downto 2*sl) <= rd(2*p+1 downto 2*p);
     end generate;
     lbm_inst: entity work.vhsnunzip_quad_lram

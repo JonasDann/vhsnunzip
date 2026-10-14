@@ -37,8 +37,8 @@ architecture behavior of vhsnunzip_quad_lt_mem is
   type wa_mem_type is array (0 to 2**WQ_LOG2-1) of std_logic_vector(9 downto 0);
 begin
 
-  -- Each write queue keeps its lines in block RAM and their addresses in
-  -- LUTRAM. The block RAM read takes a cycle, so a line can be drained from
+  -- Each write queue keeps its lines in UltraRAM and their addresses in
+  -- LUTRAM. The UltraRAM read takes a cycle, so a line can be drained from
   -- the second cycle after it was queued on (one cycle later than with an
   -- asynchronous read, when the queue was empty). The reservation follows a
   -- shadow count that drains as soon as possible, so the group former sees
@@ -62,7 +62,7 @@ begin
     signal a_dout  : std_logic_vector(255 downto 0);
     signal b_dout  : std_logic_vector(255 downto 0);
     attribute ram_style : string;
-    attribute ram_style of wq : signal is "block";
+    attribute ram_style of wq : signal is "ultra";
   begin
 
     wr_en <= wr_valid when wr_line(0) = to_unsigned(b, 1)(0) else '0';
