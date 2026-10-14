@@ -18,7 +18,7 @@ use work.vhsnunzip_int_pkg.all;
 --              -> S1a/S1b (per-lane control)
 --              -> S2a (memory reads, rotators, merge)
 --              -> S2b (recent-history/replicate/stride fill, history write)
---              -> output FIFO (+ long-term write queues)
+--              -> output FIFO (+ long-term memory writes)
 --
 -- An "element" is one Snappy copy plus the literal directly following it, a
 -- literal alone, or the end-of-chunk marker.
@@ -82,18 +82,19 @@ package vhsnunzip_quad_pkg is
     lt    : std_logic;              -- copy source in long-term memory (CK_HIST only)
     csrj  : unsigned(1 downto 0);   -- CSR: slot containing the source
     csrl  : std_logic;              -- CSR: source in that slot's literal part
+    ltb   : unsigned(1 downto 0);   -- long-term: read bus of the first source line
+                                    -- (a second line is on bus ltb + 1)
   end record;
 
   constant QSLOT_ZERO : qslot_type := (
     act => '0', pos => (others => '0'), c => (others => '0'), l => (others => '0'),
     ck => CK_NONE, off => (others => '0'), src => (others => '0'), q => (others => '0'), lt => '0',
-    csrj => (others => '0'), csrl => '0');
+    csrj => (others => '0'), csrl => '0', ltb => (others => '0'));
 
   type qslot_array is array (natural range <>) of qslot_type;
 
-  -- Long-term read port bundle: index 0 = even bank port B, 1 = even bank
-  -- port A, 2 = odd bank port B, 3 = odd bank port A.
-  type lt_addr_array is array (natural range <>) of unsigned(9 downto 0);
+  -- Long-term read buses 0 .. 3 (line addresses).
+  type lt_addr_array is array (natural range <>) of unsigned(10 downto 0);
 
   -- A group: what the datapath does in one cycle.
   type qgroup_type is record
@@ -126,6 +127,7 @@ package vhsnunzip_quad_pkg is
     rsl   : unsigned(1 downto 0);   -- RK_LIT: slot whose literal vector holds the source
     per   : unsigned(4 downto 0);   -- RK_REP: period (power of two <= 16); src = p0 - per
     sh    : unsigned(4 downto 0);   -- RK_REP: phase of the first byte within the period
+    ltb   : unsigned(1 downto 0);   -- RK_LT: read bus of the first source line
   end record;
 
   type qres_array is array (natural range <>) of qres_type;
@@ -174,7 +176,6 @@ package vhsnunzip_quad_pkg is
       el_cnt      : in  unsigned(2 downto 0);
       el_space    : out std_logic;
       lb_wpos     : in  unsigned(19 downto 0);
-      wq_resv     : in  std_logic_vector(1 downto 0);
       stall       : in  std_logic;
       gr          : out qgroup_type
     );
@@ -210,8 +211,7 @@ package vhsnunzip_quad_pkg is
       rdat        : out byte_matrix(0 to 3);
       wr_valid    : in  std_logic;
       wr_line     : in  unsigned(10 downto 0);
-      wr_data     : in  byte_array(0 to QB-1);
-      wq_resv     : out std_logic_vector(1 downto 0)
+      wr_data     : in  byte_array(0 to QB-1)
     );
   end component;
 

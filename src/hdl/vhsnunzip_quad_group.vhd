@@ -36,11 +36,10 @@ use work.vhsnunzip_quad_pkg.all;
 --    its copy or literal part; a source in a stride piece ends the group
 --    before the slot;
 --  - source straddling the group start: cut to the part before p;
---  - long-term source (more than 31 lines back): the lines are read from
---    even/odd banks with two ports each (B, then A unless the write queue
---    reserved it). If the second line of a two-line piece can't be granted the
---    piece is cut at the line end; if the first can't, the group ends before
---    the slot.
+--  - long-term source (more than 31 lines back): a group reads at most four
+--    long-term lines (any four, one per read bus). If the second line of a
+--    two-line piece can't be granted the piece is cut at the line end; if the
+--    first can't, the group ends before the slot.
 entity vhsnunzip_quad_group is
   port (
     clk         : in  std_logic;
@@ -53,9 +52,6 @@ entity vhsnunzip_quad_group is
 
     -- Compressed position up to which the literal buffer has been written.
     lb_wpos     : in  unsigned(19 downto 0);
-
-    -- Long-term write queue reservation per bank (port A must stay free).
-    wq_resv     : in  std_logic_vector(1 downto 0);
 
     -- Output backpressure.
     stall       : in  std_logic;
@@ -99,7 +95,6 @@ architecture behavior of vhsnunzip_quad_group is
     tgts   : std_logic;   -- CSR: the source element is strideable
     lt     : std_logic;   -- long-term copy
     two    : std_logic;   -- long-term copy spanning two lines
-    par    : std_logic;   -- bank (line parity) of the first source line
     ovl    : std_logic;   -- self-overlapping (off < cp)
     olt32  : std_logic;   -- off < 32
     len7   : unsigned(6 downto 0);  -- min(cp + li, 127) (pre-pass only)
@@ -117,7 +112,7 @@ architecture behavior of vhsnunzip_quad_group is
     last => '0', pw2 => '0', s4 => '0', strb => '0', hascp => '0',
     o => (others => '0'), ecp => (others => '0'), e => (others => '0'),
     omc => (others => '0'), slan => (others => '0'), cov => (others => '0'),
-    jd => "00", part => '0', cutc => '0', tgts => '0', lt => '0', two => '0', par => '0',
+    jd => "00", part => '0', cutc => '0', tgts => '0', lt => '0', two => '0',
     ovl => '0', olt32 => '0', len7 => (others => '0'),
     bbs => (others => '0'), bbe => (others => '0'), yco => (others => '0'), ystr => '0');
 
@@ -128,7 +123,7 @@ architecture behavior of vhsnunzip_quad_group is
   -- is left out: elements are consecutive, so the start of window slot k >= 1
   -- is the end of slot k - 1 whenever it matters (slot k is only used if
   -- slot k - 1 isn't the end of a chunk), and the head doesn't need it.
-  constant QE_BITS : natural := 16 + 3*PW + 5 + 7 + 6 + 2 + 8;
+  constant QE_BITS : natural := 16 + 3*PW + 5 + 7 + 6 + 2 + 7;
 
   function qe_pack(e : qe_type) return std_logic_vector is
   begin
@@ -136,7 +131,7 @@ architecture behavior of vhsnunzip_quad_group is
          & e.last & e.pw2 & e.s4 & e.strb & e.hascp
          & std_logic_vector(e.ecp) & std_logic_vector(e.e)
          & std_logic_vector(e.omc) & std_logic_vector(e.cov)
-         & std_logic_vector(e.jd) & e.part & e.cutc & e.tgts & e.lt & e.two & e.par & e.ovl & e.olt32;
+         & std_logic_vector(e.jd) & e.part & e.cutc & e.tgts & e.lt & e.two & e.ovl & e.olt32;
   end function;
 
   function qe_unpack(v : std_logic_vector(QE_BITS-1 downto 0)) return qe_type is
@@ -156,9 +151,9 @@ architecture behavior of vhsnunzip_quad_group is
     e.e := take(PW);
     e.omc := take(7);
     e.cov := take(6);
-    e.jd := unsigned(v(9 downto 8));
-    e.part := v(7); e.cutc := v(6); e.tgts := v(5); e.lt := v(4);
-    e.two := v(3); e.par := v(2); e.ovl := v(1); e.olt32 := v(0);
+    e.jd := unsigned(v(8 downto 7));
+    e.part := v(6); e.cutc := v(5); e.tgts := v(4); e.lt := v(3);
+    e.two := v(2); e.ovl := v(1); e.olt32 := v(0);
     return e;
   end function;
 
@@ -213,7 +208,6 @@ architecture behavior of vhsnunzip_quad_group is
   signal hfresh   : std_logic := '1';
   signal bubble   : std_logic := '0';
   signal wpos_r   : pos_type := (others => '0');
-  signal resv_r   : std_logic_vector(1 downto 0) := "00";
   signal lsafe    : std_logic := '0';
 
   -- Snapshot for G2b.
@@ -324,7 +318,6 @@ begin
         if slan + resize(x.cp, 6) > 32 or x.cp > 32 then
           x.two := '1';
         end if;
-        x.par := src(5);
         x.slan := src(4 downto 0);
         p2a(k) <= x;
       end loop;
@@ -554,7 +547,6 @@ begin
   begin
     if rising_edge(clk) then
       wpos_r <= lb_wpos(PW-1 downto 0);
-      resv_r <= wq_resv;
       d := wpos_r(15 downto 0) - gr.lnext;
       ok := '0';
       if d(15) = '0' and d >= 320 then
@@ -588,10 +580,10 @@ begin
   -- G2: group formation loop.
   --
   -- Everything that depends on the group start p is a comparison of p with a
-  -- precomputed position; long-term port grants don't depend on p at all
-  -- (only on which elements are in the window). The next window, FIFO read
-  -- pointer and head state are precomputed for every possible number of
-  -- consumed elements and selected at the end.
+  -- precomputed position; long-term read grants only depend on p through the
+  -- line count of a partially done head. The next window, FIFO read pointer
+  -- and head state are precomputed for every possible number of consumed
+  -- elements and selected at the end.
   -----------------------------------------------------------------------------
   g2_proc: process (clk) is
     variable go       : std_logic;
@@ -617,11 +609,9 @@ begin
     variable dbl0     : std_logic;
     variable conf     : std_logic;
     variable rq       : std_logic_vector(0 to QK-1);
-    variable rqa, rqb : std_logic_vector(0 to QK-1);  -- bank 0 / bank 1 needed
-    variable fpar     : std_logic_vector(0 to QK-1);
-    variable cap      : u2_array(0 to 1);
-    variable used     : u2_array(0 to 1);
-    variable b1, b2   : integer range 0 to 1;
+    variable rq2      : std_logic_vector(0 to QK-1);  -- two lines requested
+    variable used     : unsigned(2 downto 0);
+    variable hs5      : unsigned(4 downto 0);
     variable pend     : pos_type;
     variable glast    : std_logic;
     variable partial  : std_logic;
@@ -736,52 +726,49 @@ begin
         end if;
       end loop;
 
-      -- Long-term port requests per bank. The head uses its precomputed lines
-      -- when it is fresh; a remainder conservatively takes both banks, even if
-      -- only its literal is left (so the requests don't depend on p).
+      -- Long-term line requests. The head uses its precomputed line count
+      -- when it is fresh; for a remainder it follows from the copy bytes left
+      -- (r0) and the source lane (p - off), which only takes the low bits of
+      -- r0 besides the comparisons made for hc and hov.
       for k in 0 to QK-1 loop
         if k = 0 then
           rq(k) := h.lt and not h.strb;
           if hfresh = '1' then
-            fpar(k) := h.par;
-            if h.two = '1' then
-              rqa(k) := rq(k); rqb(k) := rq(k);
-            else
-              rqa(k) := rq(k) and not h.par; rqb(k) := rq(k) and h.par;
-            end if;
+            rq2(k) := rq(k) and h.two;
           else
-            fpar(k) := h.par;
-            rqa(k) := rq(k); rqb(k) := rq(k);
+            hs5 := p(4 downto 0) - hoff(4 downto 0);
+            rq(k) := rq(k) and hc;
+            if hs5 /= 0 and (r0(PW-2 downto 5) /= 0 or resize(r0(4 downto 0), 6) + resize(hs5, 6) > 32) then
+              rq2(k) := rq(k);
+            else
+              rq2(k) := '0';
+            end if;
           end if;
         else
           rq(k) := ltk(k);
-          fpar(k) := w(k).par;
-          if w(k).two = '1' then
-            rqa(k) := rq(k); rqb(k) := rq(k);
-          else
-            rqa(k) := rq(k) and not w(k).par; rqb(k) := rq(k) and w(k).par;
-          end if;
+          rq2(k) := rq(k) and w(k).two;
         end if;
       end loop;
-      cap(0) := "10";
-      cap(1) := "10";
-      if resv_r(0) = '1' then cap(0) := "01"; end if;
-      if resv_r(1) = '1' then cap(1) := "01"; end if;
-      used(0) := "00";
-      used(1) := "00";
+      -- At most four lines per group. The head always gets its lines; used
+      -- saturates at 4 (a slot that doesn't get its first line ends the group).
+      used := "000";
       for k in 0 to QK-1 loop
         if k > 0 and rq(k) = '1' then
-          if fpar(k) = '1' then b1 := 1; b2 := 0; else b1 := 0; b2 := 1; end if;
-          if used(b1) >= cap(b1) then
+          if used(2) = '1' then
             blk(k) := '1';
-          elsif w(k).two = '1' and used(b2) >= cap(b2) and resize(g(k)(4 downto 0), 7) + resize(w(k).cov, 7) < 32 then
+          elsif w(k).two = '1' and used = 3 and resize(g(k)(4 downto 0), 7) + resize(w(k).cov, 7) < 32 then
             -- The first source line ends inside the group.
             cut(k) := '1';
             stp(k) := w(k-1).e + resize(w(k).cov, PW);
           end if;
         end if;
-        if rqa(k) = '1' then used(0) := used(0) + 1; end if;
-        if rqb(k) = '1' then used(1) := used(1) + 1; end if;
+        if used(2) = '0' then
+          if rq2(k) = '1' and used /= 3 then
+            used := used + 2;
+          elsif rq(k) = '1' then
+            used := used + 1;
+          end if;
+        end if;
       end loop;
 
       for k in 0 to QK-1 loop
@@ -1072,36 +1059,36 @@ begin
     end if;
   end process;
 
-  -- G2c: long-term read port assignment (the first line of a bank gets port
-  -- B, the second port A).
+  -- G2c: long-term read bus assignment, in slot order (the head gets buses 0
+  -- and 1).
   g2c_proc: process (clk) is
     variable g     : qgroup_type;
-    variable used  : u2_array(0 to 1);
-    variable b1, b2: integer range 0 to 1;
+    variable n     : unsigned(2 downto 0);
     variable line  : unsigned(10 downto 0);
-    variable pid   : integer range 0 to 3;
   begin
     if rising_edge(clk) then
       g := gb;
       g.rd_v := "0000";
       g.rd_a := (others => (others => '0'));
-      used(0) := "00";
-      used(1) := "00";
+      n := "000";
       for k in 0 to QK-1 loop
+        g.s(k).ltb := n(1 downto 0);
         if gb_ltr(k) = '1' then
+          -- pragma translate_off
+          assert gb.valid = '0' or n /= 4 report "long-term read bus overflow" severity failure;
+          -- pragma translate_on
           line := gb_ltl(k);
-          if line(0) = '1' then b1 := 1; b2 := 0; else b1 := 0; b2 := 1; end if;
-          pid := 2*b1 + to_integer(used(b1)(0 downto 0));
-          g.rd_v(pid) := '1';
-          g.rd_a(pid) := line(10 downto 1);
-          used(b1) := used(b1) + 1;
+          g.rd_v(to_integer(n(1 downto 0))) := '1';
+          g.rd_a(to_integer(n(1 downto 0))) := line;
+          n := n + 1;
           -- The piece spans two lines.
           if resize(gb_ltn(k), 6) + gb.s(k).c > 32 then
-            line := line + 1;
-            pid := 2*b2 + to_integer(used(b2)(0 downto 0));
-            g.rd_v(pid) := '1';
-            g.rd_a(pid) := line(10 downto 1);
-            used(b2) := used(b2) + 1;
+            -- pragma translate_off
+            assert gb.valid = '0' or n /= 4 report "long-term read bus overflow" severity failure;
+            -- pragma translate_on
+            g.rd_v(to_integer(n(1 downto 0))) := '1';
+            g.rd_a(to_integer(n(1 downto 0))) := line + 1;
+            n := n + 1;
           end if;
         end if;
       end loop;

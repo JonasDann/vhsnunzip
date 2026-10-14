@@ -210,7 +210,7 @@ begin
           if k = 0 then
             case s(1 downto 0) is
               when "01" => sv(ly) := lt(0)(ly);
-              when "10" => sv(ly) := lt(2)(ly);
+              when "10" => sv(ly) := lt(1)(ly);
               when others => sv(ly) := st_rd(0)(ly);
             end case;
           else
@@ -275,7 +275,7 @@ use work.vhsnunzip_quad_pkg.all;
 --    previous group's output.
 --  - older, up to 31 lines back: short-term memory (per-lane LUTRAM, written
 --    in S2b, read in S2a; by then every byte older than p0-32 is written).
---  - older still: long-term memory (URAM, even/odd line banks).
+--  - older still: long-term memory (URAM, four copies, one per read bus).
 entity vhsnunzip_quad_datapath is
   port (
     clk         : in  std_logic;
@@ -453,17 +453,6 @@ architecture behavior of vhsnunzip_quad_datapath is
   signal pend_d   : std_logic;
   signal pcnt_d   : unsigned(QI downto 0);
 
-  function pid_of(line : unsigned(10 downto 0); g : qgroup_type) return unsigned is
-    variable b : integer range 0 to 1;
-  begin
-    if line(0) = '1' then b := 1; else b := 0; end if;
-    if g.rd_v(2*b) = '1' and g.rd_a(2*b) = line(10 downto 1) then
-      return to_unsigned(2*b, 2);
-    else
-      return to_unsigned(2*b + 1, 2);
-    end if;
-  end function;
-
   -- The top hc bits of a 5-bit lane index.
   function top_bits(hc : unsigned(2 downto 0)) return unsigned is
     variable r : unsigned(4 downto 0);
@@ -503,6 +492,7 @@ begin
         res(k).rsl := to_unsigned(k, 2);
         res(k).per := gr.s(k).off(4 downto 0);
         res(k).sh := (others => '0');
+        res(k).ltb := gr.s(k).ltb;
         r0c(k) <= '0';
         srel := gr.s(k).pos - gr.s(k).off(5 downto 0);
         j := to_integer(gr.s(k).csrj);
@@ -547,6 +537,7 @@ begin
   g3b_proc: process (clk) is
     variable res   : qres_array(0 to QK-1);
     variable delta : unsigned(5 downto 0);
+    variable sl    : unsigned(5 downto 0);
     variable j     : integer range 0 to QK-1;
   begin
     if rising_edge(clk) then
@@ -570,6 +561,10 @@ begin
             when others =>
               res(k).rk := res(j).rk;
               res(k).src := res(j).src + resize(delta, 16);
+              -- A long-term source reuses slot j's lines: its first line is
+              -- slot j's second line if the source lane wraps.
+              sl := resize(res(j).src(4 downto 0), 6) + delta;
+              res(k).ltb := res(j).ltb + resize(sl(5 downto 5), 2);
           end case;
         end if;
       end loop;
@@ -589,12 +584,10 @@ begin
     variable ol    : unsigned(15 downto 0);
     variable src   : unsigned(15 downto 0);
     variable dist  : unsigned(15 downto 0);
-    variable line  : unsigned(10 downto 0);
     variable cb    : unsigned(6 downto 0);
     variable lb    : unsigned(6 downto 0);
     variable rb    : unsigned(6 downto 0);
-    variable pid1  : unsigned(1 downto 0);
-    variable pid2  : unsigned(1 downto 0);
+    variable ltb2  : unsigned(1 downto 0);
     variable v     : s1a_type;
   begin
     v.valid := r1.valid;
@@ -646,19 +639,18 @@ begin
       v.s(k).rsl := r1res(k).rsl;
       v.s(k).rot := src(4 downto 0) - o(4 downto 0);
       v.s(k).sst := src(4 downto 0);
-      line := src(15 downto 5);
-      pid1 := pid_of(line, r1);
-      pid2 := pid_of(line + 1, r1);
+      ltb2 := r1res(k).ltb + 1;
       v.s(k).sca := "000";
       v.s(k).scb := "000";
       if r1res(k).rk = RK_LT then
+        -- Long-term buses ltb (first line) and ltb + 1 (second line); slot 0
+        -- always gets buses 0 and 1.
         if k = 0 then
-          -- Slot 0 always gets port B (0 or 2) of a bank.
-          v.s(k).sca := '0' & pid1(1) & not pid1(1);
-          v.s(k).scb := '0' & pid2(1) & not pid2(1);
+          v.s(k).sca := "001";
+          v.s(k).scb := "010";
         else
-          v.s(k).sca := resize(pid1, 3) + 1;
-          v.s(k).scb := resize(pid2, 3) + 1;
+          v.s(k).sca := resize(r1res(k).ltb, 3) + 1;
+          v.s(k).scb := resize(ltb2, 3) + 1;
         end if;
       elsif r1res(k).rk = RK_LIT and k > 0 then
         v.s(k).sca := resize(r1res(k).rsl, 3) + 5;

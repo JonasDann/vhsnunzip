@@ -52,7 +52,6 @@ architecture behavior of vhsnunzip_quad is
   signal el_cnt     : unsigned(2 downto 0);
   signal el_space   : std_logic;
 
-  signal wq_resv    : std_logic_vector(1 downto 0);
   signal stall      : std_logic := '0';
   signal gr         : qgroup_type;
   signal lt_rdat    : byte_matrix(0 to 3);
@@ -125,7 +124,6 @@ begin
       el_cnt      => el_cnt,
       el_space    => el_space,
       lb_wpos     => lb_wpos,
-      wq_resv     => wq_resv,
       stall       => stall,
       gr          => gr
     );
@@ -159,8 +157,7 @@ begin
       rdat        => lt_rdat,
       wr_valid    => ln_valid,
       wr_line     => ln_line,
-      wr_data     => ln_data,
-      wq_resv     => wq_resv
+      wr_data     => ln_data
     );
 
   out_proc: process (out_pdata, out_pcnt, out_plast) is
