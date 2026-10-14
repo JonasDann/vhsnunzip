@@ -2,13 +2,113 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
+-- Two-port lookup table in block RAM (registered read, synchronous output
+-- clear), for per-lane decisions of the quad datapath that are functions of
+-- a few bits:
+--  KIND 0: lane mask of a group-relative boundary b, a = p0l & b (4 .. 0):
+--          bit x = ((x - p0l) mod 32 >= b); b >= 32 clears the output.
+--  KIND 1: stride source of a lane, a = d8 & rr(4 .. 2) & s, s(i - 1): the
+--          lane 4 * i before is a stride byte (i = 1 .. 7): q(2 .. 0) =
+--          z - 1 for the first i = z that is not (only even i if d8), q(3):
+--          there is none within the group (z = 0 or z > rr / 4).
+--  KIND 2: per-lane memory line for 32 bytes from position a (line a / 32,
+--          start lane a mod 32): bits 5*ly+4 .. 5*ly = a / 32 + 1 for the
+--          lanes ly before the start lane, a / 32 for the others.
+entity vhsnunzip_quad_rom is
+  generic (
+    KIND        : natural;
+    AW          : natural;
+    DW          : natural
+  );
+  port (
+    clk         : in  std_logic;
+    a0          : in  std_logic_vector(AW-1 downto 0);
+    a1          : in  std_logic_vector(AW-1 downto 0);
+    z0          : in  std_logic;
+    z1          : in  std_logic;
+    q0          : out std_logic_vector(DW-1 downto 0);
+    q1          : out std_logic_vector(DW-1 downto 0)
+  );
+end vhsnunzip_quad_rom;
+
+architecture behavior of vhsnunzip_quad_rom is
+  type rom_type is array (0 to 2**AW-1) of std_logic_vector(DW-1 downto 0);
+
+  function rom_init return rom_type is
+    variable r  : rom_type;
+    variable p  : integer;
+    variable b  : integer;
+    variable rv : integer;
+    variable z  : integer;
+    variable sv : std_logic_vector(6 downto 0);
+  begin
+    for a in 0 to 2**AW-1 loop
+      r(a) := (others => '0');
+      if KIND = 2 then
+        for ly in 0 to 31 loop
+          if ly < a mod 32 then
+            r(a)(5*ly+4 downto 5*ly) := std_logic_vector(to_unsigned((a / 32 + 1) mod 32, 5));
+          else
+            r(a)(5*ly+4 downto 5*ly) := std_logic_vector(to_unsigned(a / 32, 5));
+          end if;
+        end loop;
+      elsif KIND = 0 then
+        p := a / 32;
+        b := a mod 32;
+        for x in 0 to DW-1 loop
+          if (x - p) mod 32 >= b then
+            r(a)(x) := '1';
+          end if;
+        end loop;
+      else
+        sv := std_logic_vector(to_unsigned(a mod 128, 7));
+        rv := (a / 128) mod 8;
+        z := 0;
+        for i in 7 downto 1 loop
+          if sv(i - 1) = '0' and (a / 1024 = 0 or i mod 2 = 0) then
+            z := i;
+          end if;
+        end loop;
+        r(a)(2 downto 0) := std_logic_vector(to_unsigned((z + 7) mod 8, 3));
+        if z = 0 or z > rv then
+          r(a)(3) := '1';
+        end if;
+      end if;
+    end loop;
+    return r;
+  end function;
+
+  signal rom : rom_type := rom_init;
+  attribute rom_style : string;
+  attribute rom_style of rom : signal is "block";
+begin
+  rd_proc: process (clk) is
+  begin
+    if rising_edge(clk) then
+      if z0 = '1' then
+        q0 <= (others => '0');
+      else
+        q0 <= rom(to_integer(unsigned(a0)));
+      end if;
+      if z1 = '1' then
+        q1 <= (others => '0');
+      else
+        q1 <= rom(to_integer(unsigned(a1)));
+      end if;
+    end if;
+  end process;
+end behavior;
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
 library work;
 use work.vhsnunzip_int_pkg.all;
 use work.vhsnunzip_quad_pkg.all;
 
 -- S2a of the quad datapath: copy source select per slot, rotators and merge
--- (registered output). Kept as its own hierarchy level so synthesis maps
--- the merge onto wide multiplexers.
+-- (registered output).
 entity vhsnunzip_quad_merge is
   port (
     clk   : in  std_logic;
@@ -110,6 +210,10 @@ use work.vhsnunzip_quad_pkg.all;
 --   S2b : recent-history fill (copies from the last 32 bytes, replicated
 --         slot 0), stride fill, short-term write, output line
 --
+-- Per-lane decisions that are functions of a few bits (boundary lane masks,
+-- memory lines, stride sources) are looked up in block RAM tables
+-- (vhsnunzip_quad_rom), which register them like the pipeline registers.
+--
 -- History is split in three by age, relative to the group start p0:
 --  - [p0-32, p0): the "recent" register LW, which holds the most recent byte
 --    of every lane. Read per output lane in S2b, so it already contains the
@@ -176,24 +280,20 @@ architecture behavior of vhsnunzip_quad_datapath is
     rsl   : unsigned(1 downto 0);
     rot   : unsigned(4 downto 0);
     lrot  : unsigned(4 downto 0);
-    -- Source addressing: source lanes below the source start lane (ms) and
-    -- below the literal start lane (mq) read the next line; copy source
-    -- select code for the two cases.
+    -- Source line (the source lanes below the start lane read the next
+    -- one; see the line tables) and the copy source select code for the
+    -- source line and the next.
     sline : unsigned(4 downto 0);
-    slin1 : unsigned(4 downto 0);
-    qline : unsigned(4 downto 0);
-    qlin1 : unsigned(4 downto 0);
-    ms    : std_logic_vector(0 to QB-1);
-    mq    : std_logic_vector(0 to QB-1);
     sca   : unsigned(2 downto 0);
     scb   : unsigned(2 downto 0);
-    -- Recent-register index of a copy byte at output lane x:
-    -- ((x + ia) and im) + ib. Plain copies: x + rot. Replicated pieces:
-    -- p0l - per + ((x - p0l - pos + sh) mod per). Stride pieces (used for
-    -- bytes whose stride source is before the group): p0l - d + (rr mod d).
+    -- Recent-register index of a copy byte at output lane x: plain copies
+    -- x + rot; replicated pieces p0l - per + ((x - p0l - pos + sh) mod per);
+    -- stride pieces (used for bytes whose stride source is before the
+    -- group) p0l - d + (rr mod d). With a power of two P (per or d), the
+    -- last two are p0l + ((x + ia) or hm), hm = 32 - P (the top hc bits
+    -- set), so all are ((x + ia) or hm) + (p0l if hc /= 0).
     ia    : unsigned(4 downto 0);
-    im    : unsigned(4 downto 0);
-    ib    : unsigned(4 downto 0);
+    hc    : unsigned(2 downto 0);
     strf  : std_logic;
   end record;
   type s1a_slot_array is array (natural range <>) of s1a_slot_type;
@@ -232,10 +332,9 @@ architecture behavior of vhsnunzip_quad_datapath is
     -- per output lane: piece select (slot, literal, rotation bit 4)
     own   : u4_array(0 to QB-1);
     ing   : std_logic_vector(0 to QB-1);
-    rec   : std_logic_vector(0 to QB-1);
     idx   : u5_array(0 to QB-1);
-    str   : std_logic_vector(0 to QB-1);
-    sdi   : u3_array(0 to QB-1);    -- stride source distance 4 * (sdi + 1)
+    rcl   : std_logic_vector(0 to QB-1);    -- recent part of a copy
+    strl  : std_logic_vector(0 to QB-1);    -- stride piece
   end record;
   signal r3       : s1b_type;
   signal r3_valid : std_logic := '0';
@@ -256,8 +355,28 @@ architecture behavior of vhsnunzip_quad_datapath is
   signal r4_valid : std_logic := '0';
   signal r4m      : byte_array(0 to QB-1);
 
-  attribute keep_hierarchy : string;
-  attribute keep_hierarchy of merge_inst : label is "yes";
+  signal s1a_v    : s1a_type;
+  signal s1b_v    : s1b_type;
+
+  -- Lane masks of the piece boundaries (valid in S1b): rb, cb of slots 0 ..
+  -- 3, lb of slots 0 .. 2, and the group end n.
+  constant NM     : natural := 12;
+  type slv32_array is array (natural range <>) of std_logic_vector(QB-1 downto 0);
+  type slv10_array is array (natural range <>) of std_logic_vector(9 downto 0);
+  signal mk_a     : slv10_array(0 to NM-1);
+  signal mk_z     : std_logic_vector(0 to NM-1);
+  signal mk_q     : slv32_array(0 to NM-1);
+
+  -- Per-lane memory lines of the copy source (short-term memory) and the
+  -- literal (literal buffer) of each slot (valid in S1b).
+  type slv160_array is array (natural range <>) of std_logic_vector(5*QB-1 downto 0);
+  signal ln_q     : slv160_array(0 to 2*QK-1);
+
+  -- Stride source per lane (valid in S2a).
+  type slv11_array is array (natural range <>) of std_logic_vector(10 downto 0);
+  type slv4_array is array (natural range <>) of std_logic_vector(3 downto 0);
+  signal sd_a     : slv11_array(0 to QB-1);
+  signal sd_q     : slv4_array(0 to QB-1);
 
   -- Pipeline registers stay flip-flops (not shift-register LUTs).
   attribute shreg_extract : string;
@@ -291,6 +410,16 @@ architecture behavior of vhsnunzip_quad_datapath is
     else
       return to_unsigned(2*b + 1, 2);
     end if;
+  end function;
+
+  -- The top hc bits of a 5-bit lane index.
+  function top_bits(hc : unsigned(2 downto 0)) return unsigned is
+    variable r : unsigned(4 downto 0);
+  begin
+    for b in 0 to 4 loop
+      if hc >= 5 - b then r(b) := '1'; else r(b) := '0'; end if;
+    end loop;
+    return r;
   end function;
 
   function sat6(v : unsigned) return unsigned is
@@ -403,7 +532,7 @@ begin
   -----------------------------------------------------------------------------
   -- S1a: per-slot scalars.
   -----------------------------------------------------------------------------
-  s1a_proc: process (clk) is
+  s1a_proc: process (r1, r1res) is
     variable o     : unsigned(15 downto 0);
     variable ol    : unsigned(15 downto 0);
     variable src   : unsigned(15 downto 0);
@@ -416,100 +545,101 @@ begin
     variable pid2  : unsigned(1 downto 0);
     variable v     : s1a_type;
   begin
-    if rising_edge(clk) then
-      v.valid := r1.valid;
-      v.p0l := r1.p0(4 downto 0);
-      v.n := r1.n;
-      v.last := r1.last;
-      v.line0 := r1.p0(15 downto 5);
-      v.lnext := r1.lnext;
-      v.d8 := '0';
-      for k in QK-1 downto 0 loop
-        if r1res(k).rk = RK_STRIDE and r1.s(k).off(3) = '1' then
-          v.d8 := '1';
-        end if;
-      end loop;
-      for x in 0 to QB-1 loop
-        v.rr(x) := to_unsigned(x, 5) - r1.p0(4 downto 0);
-      end loop;
-      for k in 0 to QK-1 loop
-        o := r1.p0 + resize(r1.s(k).pos, 16);
-        ol := o + resize(r1.s(k).c, 16);
-        src := r1res(k).src;
-        cb := resize(r1.s(k).pos, 7) + resize(r1.s(k).c, 7);
-        lb := cb + resize(r1.s(k).l, 7);
-        dist := r1.p0 - src;
-        rb := cb;
-        case r1res(k).rk is
-          when RK_ST =>
-            -- Copy bytes whose source is at or after p0 - 32.
-            if dist <= 32 then
-              rb := resize(r1.s(k).pos, 7);
-            elsif dist <= 64 then
-              rb := resize(r1.s(k).pos, 7) + resize(dist(6 downto 0) - 32, 7);
-            end if;
-          when RK_REP =>
+    v.valid := r1.valid;
+    v.p0l := r1.p0(4 downto 0);
+    v.n := r1.n;
+    v.last := r1.last;
+    v.line0 := r1.p0(15 downto 5);
+    v.lnext := r1.lnext;
+    v.d8 := '0';
+    for k in QK-1 downto 0 loop
+      if r1res(k).rk = RK_STRIDE and r1.s(k).off(3) = '1' then
+        v.d8 := '1';
+      end if;
+    end loop;
+    for x in 0 to QB-1 loop
+      v.rr(x) := to_unsigned(x, 5) - r1.p0(4 downto 0);
+    end loop;
+    for k in 0 to QK-1 loop
+      o := r1.p0 + resize(r1.s(k).pos, 16);
+      ol := o + resize(r1.s(k).c, 16);
+      src := r1res(k).src;
+      cb := resize(r1.s(k).pos, 7) + resize(r1.s(k).c, 7);
+      lb := cb + resize(r1.s(k).l, 7);
+      dist := r1.p0 - src;
+      rb := cb;
+      case r1res(k).rk is
+        when RK_ST =>
+          -- Copy bytes whose source is at or after p0 - 32.
+          if dist <= 32 then
             rb := resize(r1.s(k).pos, 7);
-          when others =>
-            null;
-        end case;
-        if r1.s(k).act = '1' then
-          v.s(k).rb := sat6(rb);
-          v.s(k).cb := sat6(cb);
-          v.s(k).lb := sat6(lb);
-        else
-          v.s(k).rb := to_unsigned(63, 6);
-          v.s(k).cb := to_unsigned(63, 6);
-          v.s(k).lb := to_unsigned(63, 6);
-        end if;
-        v.s(k).rk := r1res(k).rk;
-        v.s(k).rsl := r1res(k).rsl;
-        v.s(k).rot := src(4 downto 0) - o(4 downto 0);
-        v.s(k).sline := src(9 downto 5);
-        v.s(k).slin1 := src(9 downto 5) + 1;
-        v.s(k).qline := r1.s(k).q(9 downto 5);
-        v.s(k).qlin1 := r1.s(k).q(9 downto 5) + 1;
-        for ly in 0 to QB-1 loop
-          if ly < src(4 downto 0) then v.s(k).ms(ly) := '1'; else v.s(k).ms(ly) := '0'; end if;
-          if ly < r1.s(k).q(4 downto 0) then v.s(k).mq(ly) := '1'; else v.s(k).mq(ly) := '0'; end if;
-        end loop;
-        line := src(15 downto 5);
-        pid1 := pid_of(line, r1);
-        pid2 := pid_of(line + 1, r1);
-        v.s(k).sca := "000";
-        v.s(k).scb := "000";
-        if r1res(k).rk = RK_LT then
-          if k = 0 then
-            -- Slot 0 always gets port B (0 or 2) of a bank.
-            v.s(k).sca := '0' & pid1(1) & not pid1(1);
-            v.s(k).scb := '0' & pid2(1) & not pid2(1);
-          else
-            v.s(k).sca := resize(pid1, 3) + 1;
-            v.s(k).scb := resize(pid2, 3) + 1;
+          elsif dist <= 64 then
+            rb := resize(r1.s(k).pos, 7) + resize(dist(6 downto 0) - 32, 7);
           end if;
-        elsif r1res(k).rk = RK_LIT and k > 0 then
-          v.s(k).sca := resize(r1res(k).rsl, 3) + 5;
-          v.s(k).scb := resize(r1res(k).rsl, 3) + 5;
+        when RK_REP =>
+          rb := resize(r1.s(k).pos, 7);
+        when others =>
+          null;
+      end case;
+      if r1.s(k).act = '1' then
+        v.s(k).rb := sat6(rb);
+        v.s(k).cb := sat6(cb);
+        v.s(k).lb := sat6(lb);
+      else
+        v.s(k).rb := to_unsigned(63, 6);
+        v.s(k).cb := to_unsigned(63, 6);
+        v.s(k).lb := to_unsigned(63, 6);
+      end if;
+      v.s(k).rk := r1res(k).rk;
+      v.s(k).rsl := r1res(k).rsl;
+      v.s(k).rot := src(4 downto 0) - o(4 downto 0);
+      v.s(k).sline := src(9 downto 5);
+      line := src(15 downto 5);
+      pid1 := pid_of(line, r1);
+      pid2 := pid_of(line + 1, r1);
+      v.s(k).sca := "000";
+      v.s(k).scb := "000";
+      if r1res(k).rk = RK_LT then
+        if k = 0 then
+          -- Slot 0 always gets port B (0 or 2) of a bank.
+          v.s(k).sca := '0' & pid1(1) & not pid1(1);
+          v.s(k).scb := '0' & pid2(1) & not pid2(1);
+        else
+          v.s(k).sca := resize(pid1, 3) + 1;
+          v.s(k).scb := resize(pid2, 3) + 1;
         end if;
-        v.s(k).lrot := r1.s(k).q(4 downto 0) - ol(4 downto 0);
-        v.s(k).ia := src(4 downto 0) - o(4 downto 0);
-        v.s(k).im := (others => '1');
-        v.s(k).ib := (others => '0');
-        v.s(k).strf := '0';
-        if r1res(k).rk = RK_REP then
-          -- Replicated period per before the group.
-          v.s(k).ia := r1res(k).sh - r1.p0(4 downto 0) - r1.s(k).pos(4 downto 0);
-          v.s(k).im := r1res(k).per - 1;
-          v.s(k).ib := r1.p0(4 downto 0) - r1res(k).per;
-        elsif r1res(k).rk = RK_STRIDE then
-          -- Stride d = 4 or 8, source before the group.
-          v.s(k).ia := 0 - r1.p0(4 downto 0);
-          v.s(k).im := "00" & r1.s(k).off(3) & "11";
-          v.s(k).ib := r1.p0(4 downto 0) - resize(r1.s(k).off(3 downto 0), 5);
-          v.s(k).strf := '1';
-        end if;
-      end loop;
-      r2 <= v;
+      elsif r1res(k).rk = RK_LIT and k > 0 then
+        v.s(k).sca := resize(r1res(k).rsl, 3) + 5;
+        v.s(k).scb := resize(r1res(k).rsl, 3) + 5;
+      end if;
+      v.s(k).lrot := r1.s(k).q(4 downto 0) - ol(4 downto 0);
+      v.s(k).ia := src(4 downto 0) - o(4 downto 0);
+      v.s(k).hc := "000";
+      v.s(k).strf := '0';
+      if r1res(k).rk = RK_REP then
+        -- Replicated period per before the group.
+        v.s(k).ia := r1res(k).sh - r1.p0(4 downto 0) - r1.s(k).pos(4 downto 0);
+        case to_integer(r1res(k).per) is
+          when 1 => v.s(k).hc := "101";
+          when 2 => v.s(k).hc := "100";
+          when 4 => v.s(k).hc := "011";
+          when 8 => v.s(k).hc := "010";
+          when others => v.s(k).hc := "001";
+        end case;
+      elsif r1res(k).rk = RK_STRIDE then
+        -- Stride d = 4 or 8, source before the group.
+        v.s(k).ia := 0 - r1.p0(4 downto 0);
+        v.s(k).hc := "01" & not r1.s(k).off(3);
+        v.s(k).strf := '1';
+      end if;
+    end loop;
+    s1a_v <= v;
+  end process;
+
+  s1a_reg: process (clk) is
+  begin
+    if rising_edge(clk) then
+      r2 <= s1a_v;
       r2_valid <= r1.valid;
       if reset = '1' then
         r2_valid <= '0';
@@ -517,15 +647,61 @@ begin
     end if;
   end process;
 
+  -- Boundary masks, looked up from the S1a values (registered in the table
+  -- like the S1a outputs in R2).
+  mk_addr: process (s1a_v) is
+    variable b : unsigned(5 downto 0);
+  begin
+    for i in 0 to NM-1 loop
+      if i < 4 then
+        b := s1a_v.s(i).rb;
+      elsif i < 8 then
+        b := s1a_v.s(i - 4).cb;
+      elsif i < 11 then
+        b := s1a_v.s(i - 8).lb;
+      else
+        b := s1a_v.n;
+      end if;
+      mk_a(i) <= std_logic_vector(s1a_v.p0l) & std_logic_vector(b(4 downto 0));
+      mk_z(i) <= b(5);
+    end loop;
+  end process;
+
+  -- Memory lines, looked up from the source and literal positions in R1
+  -- (registered in the table like the S1a outputs in R2).
+  ln_gen: for k in 0 to QK-1 generate
+    rom_inst: entity work.vhsnunzip_quad_rom
+      generic map (KIND => 2, AW => 10, DW => 5*QB)
+      port map (
+        clk => clk,
+        a0  => std_logic_vector(r1res(k).src(9 downto 0)),
+        a1  => std_logic_vector(r1.s(k).q(9 downto 0)),
+        z0  => '0',
+        z1  => '0',
+        q0  => ln_q(2*k),
+        q1  => ln_q(2*k+1)
+      );
+  end generate;
+
+  mk_gen: for i in 0 to NM/2-1 generate
+    rom_inst: entity work.vhsnunzip_quad_rom
+      generic map (KIND => 0, AW => 10, DW => QB)
+      port map (
+        clk => clk,
+        a0  => mk_a(2*i),
+        a1  => mk_a(2*i+1),
+        z0  => mk_z(2*i),
+        z1  => mk_z(2*i+1),
+        q0  => mk_q(2*i),
+        q1  => mk_q(2*i+1)
+      );
+  end generate;
+
   -----------------------------------------------------------------------------
   -- S1b: per-lane control.
   -----------------------------------------------------------------------------
-  s1b_proc: process (clk) is
+  s1b_proc: process (r2, mk_q, ln_q) is
     variable v     : s1b_type;
-    variable rr    : unsigned(4 downto 0);
-    variable strl  : std_logic_vector(0 to QB-1);
-    variable rcl   : std_logic_vector(0 to QB-1);
-    variable before: std_logic;
     variable tr    : std_logic_vector(0 to QK-1);
     variable tc    : std_logic_vector(0 to QK-1);
     variable tl    : std_logic_vector(0 to QK-1);
@@ -535,105 +711,109 @@ begin
     variable lit   : std_logic;
     variable rc    : std_logic;
     variable h     : std_logic;
-    variable found : boolean;
-    variable cand  : boolean;
+    variable pm    : std_logic;
+  begin
+    v.valid := r2.valid;
+    v.p0l := r2.p0l;
+    v.n := r2.n;
+    v.last := r2.last;
+    v.line0 := r2.line0;
+    v.lnext := r2.lnext;
+
+    -- Per-slot source addressing (indexed by source lane).
+    for k in 0 to QK-1 loop
+      v.rot(k) := r2.s(k).rot(3 downto 0);
+      v.lrot(k) := r2.s(k).lrot(3 downto 0);
+      for ly in 0 to QB-1 loop
+        v.st_a(k)(ly) := unsigned(ln_q(2*k)(5*ly+4 downto 5*ly));
+        v.li_a(k)(ly) := unsigned(ln_q(2*k+1)(5*ly+4 downto 5*ly));
+        -- The lane reads the next line if its line differs in bit 0.
+        if ln_q(2*k)(5*ly) /= r2.s(k).sline(0) then
+          v.sc(k)(ly) := r2.s(k).scb;
+        else
+          v.sc(k)(ly) := r2.s(k).sca;
+        end if;
+      end loop;
+    end loop;
+
+    -- Per output lane: owner slot, piece kind, recent-register index.
+    for x in 0 to QB-1 loop
+      v.ing(x) := not mk_q(11)(x);
+      for k in 0 to QK-1 loop
+        tr(k) := mk_q(k)(x);
+        tc(k) := mk_q(4 + k)(x);
+        if k < QK-1 then
+          tl(k) := mk_q(8 + k)(x);
+        else
+          tl(k) := '0';
+        end if;
+      end loop;
+      -- Owner slot: number of literal ends passed (they are ordered).
+      s1 := tl(1);
+      s0 := (tl(0) and not tl(1)) or tl(2);
+      sl := to_integer(unsigned'(s1 & s0));
+      lit := '0';
+      rc := '0';
+      -- (Lanes past the group are don't-care, so slot 3 needs no end.)
+      tl(QK-1) := '0';
+      for k in 0 to QK-1 loop
+        lit := lit or (tc(k) and not tl(k));
+        rc := rc or (tr(k) and not tc(k));
+      end loop;
+      if lit = '1' then
+        h := r2.s(sl).lrot(4);
+      else
+        h := r2.s(sl).rot(4);
+      end if;
+      v.own(x) := to_unsigned(sl, 2) & lit & h;
+      v.strl(x) := r2.s(sl).strf and not lit;
+      if r2.s(sl).hc /= 0 then pm := '1'; else pm := '0'; end if;
+      v.idx(x) := ((to_unsigned(x, 5) + r2.s(sl).ia) or top_bits(r2.s(sl).hc))
+                + (r2.p0l and (4 downto 0 => pm));
+      v.rcl(x) := rc;
+    end loop;
+    s1b_v <= v;
+  end process;
+
+  s1b_reg: process (clk) is
   begin
     if rising_edge(clk) then
-      v.valid := r2.valid;
-      v.p0l := r2.p0l;
-      v.n := r2.n;
-      v.last := r2.last;
-      v.line0 := r2.line0;
-      v.lnext := r2.lnext;
-
-      -- Per-slot source addressing (indexed by source lane).
-      for k in 0 to QK-1 loop
-        v.rot(k) := r2.s(k).rot(3 downto 0);
-        v.lrot(k) := r2.s(k).lrot(3 downto 0);
-        for ly in 0 to QB-1 loop
-          if r2.s(k).ms(ly) = '1' then
-            v.st_a(k)(ly) := r2.s(k).slin1;
-            v.sc(k)(ly) := r2.s(k).scb;
-          else
-            v.st_a(k)(ly) := r2.s(k).sline;
-            v.sc(k)(ly) := r2.s(k).sca;
-          end if;
-          if r2.s(k).mq(ly) = '1' then
-            v.li_a(k)(ly) := r2.s(k).qlin1;
-          else
-            v.li_a(k)(ly) := r2.s(k).qline;
-          end if;
-        end loop;
-      end loop;
-
-      -- Per output lane: owner slot, piece kind, recent-register index.
-      for x in 0 to QB-1 loop
-        rr := r2.rr(x);
-        if rr < r2.n then
-          v.ing(x) := '1';
-        else
-          v.ing(x) := '0';
-        end if;
-        for k in 0 to QK-1 loop
-          if rr >= r2.s(k).rb then tr(k) := '1'; else tr(k) := '0'; end if;
-          if rr >= r2.s(k).cb then tc(k) := '1'; else tc(k) := '0'; end if;
-          if rr >= r2.s(k).lb then tl(k) := '1'; else tl(k) := '0'; end if;
-        end loop;
-        -- Owner slot: number of literal ends passed (they are ordered).
-        s1 := tl(1);
-        s0 := (tl(0) and not tl(1)) or tl(2);
-        sl := to_integer(unsigned'(s1 & s0));
-        lit := '0';
-        rc := '0';
-        -- (Lanes past the group are don't-care, so slot 3 needs no end.)
-        tl(QK-1) := '0';
-        for k in 0 to QK-1 loop
-          lit := lit or (tc(k) and not tl(k));
-          rc := rc or (tr(k) and not tc(k));
-        end loop;
-        if lit = '1' then
-          h := r2.s(sl).lrot(4);
-        else
-          h := r2.s(sl).rot(4);
-        end if;
-        v.own(x) := to_unsigned(sl, 2) & lit & h;
-        strl(x) := r2.s(sl).strf and not lit;
-        v.idx(x) := ((to_unsigned(x, 5) + r2.s(sl).ia) and r2.s(sl).im) + r2.s(sl).ib;
-        rcl(x) := rc;
-      end loop;
-
-      -- Stride source: first predecessor at distance j*d (d = 4 or 8, i.e.
-      -- 4*i) that is not a stride byte of this group; if there is none
-      -- before the group start, the byte comes from the recent register
-      -- (the index above).
-      for x in 0 to QB-1 loop
-        rr := r2.rr(x);
-        v.sdi(x) := "000";
-        before := '0';
-        found := false;
-        for i in 1 to 8 loop
-          cand := r2.d8 = '0' or i mod 2 = 0;
-          if cand and not found then
-            if rr < 4 * i then
-              before := '1';
-              found := true;
-            elsif strl((x - 4 * i) mod QB) = '0' then
-              v.sdi(x) := to_unsigned(i - 1, 3);
-              found := true;
-            end if;
-          end if;
-        end loop;
-        v.rec(x) := rcl(x) or (strl(x) and before);
-        v.str(x) := strl(x) and not before;
-      end loop;
-
-      r3 <= v;
+      r3 <= s1b_v;
       r3_valid <= r2_valid;
       if reset = '1' then
         r3_valid <= '0';
       end if;
     end if;
   end process;
+
+  -- Stride source: first predecessor at distance 4*z (d = 4 or 8; with d = 8
+  -- only even z) that is not a stride byte of this group. If it is before
+  -- the group start, the byte comes from the recent register (the index
+  -- above). Looked up from the S1b values, registered in the table like R3.
+  sd_addr: process (s1b_v, r2) is
+  begin
+    for x in 0 to QB-1 loop
+      sd_a(x)(10) <= r2.d8;
+      sd_a(x)(9 downto 7) <= std_logic_vector(r2.rr(x)(4 downto 2));
+      for i in 1 to 7 loop
+        sd_a(x)(i - 1) <= s1b_v.strl((x - 4 * i) mod QB);
+      end loop;
+    end loop;
+  end process;
+
+  sd_gen: for i in 0 to QB/2-1 generate
+    rom_inst: entity work.vhsnunzip_quad_rom
+      generic map (KIND => 1, AW => 11, DW => 4)
+      port map (
+        clk => clk,
+        a0  => sd_a(2*i),
+        a1  => sd_a(2*i+1),
+        z0  => '0',
+        z1  => '0',
+        q0  => sd_q(2*i),
+        q1  => sd_q(2*i+1)
+      );
+  end generate;
 
   -----------------------------------------------------------------------------
   -- Per-lane memories: short-term history and literal buffer.
@@ -713,10 +893,12 @@ begin
       r4.last <= r3.last;
       r4.line0 <= r3.line0;
       r4.ing <= r3.ing;
-      r4.rec <= r3.rec;
       r4.idx <= r3.idx;
-      r4.str <= r3.str;
-      r4.sdi <= r3.sdi;
+      for x in 0 to QB-1 loop
+        r4.rec(x) <= r3.rcl(x) or (r3.strl(x) and sd_q(x)(3));
+        r4.str(x) <= r3.strl(x) and not sd_q(x)(3);
+        r4.sdi(x) <= unsigned(sd_q(x)(2 downto 0));
+      end loop;
       r4_valid <= r3_valid;
       if r3_valid = '1' then
         cons_pos <= r3.lnext;

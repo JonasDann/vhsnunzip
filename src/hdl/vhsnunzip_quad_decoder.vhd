@@ -179,7 +179,9 @@ architecture behavior of vhsnunzip_quad_decoder is
   type went_type is record
     kf    : kflags_type;
     kb    : kindb_array;
-    step  : unsigned(5 downto 0);   -- next element start (if small)
+    step  : unsigned(5 downto 0);   -- next element start if small, else
+                                    -- the element's own position (so it is
+                                    -- also where the cycle's big element is)
     s2    : unsigned(5 downto 0);   -- start after that one
     bt    : unsigned(17 downto 0);  -- next element start (any size)
     btge  : std_logic;              -- bt >= 32
@@ -391,7 +393,11 @@ architecture behavior of vhsnunzip_quad_decoder is
       stx(j) := to_unsigned(j, 6) + resize(szx(j), 6);
     end loop;
     for j in 0 to QB-1 loop
-      r.t(j).step := stx(j);
+      if smx(j) = '1' then
+        r.t(j).step := stx(j);
+      else
+        r.t(j).step := to_unsigned(j, 6);
+      end if;
       r.t(j).s2 := stx(j);
       r.t(j).bt := t.e(j).bt;
       if t.e(j).bt(17 downto 5) /= 0 then
@@ -655,8 +661,7 @@ begin
     variable e0, e1, e2 : unsigned(6 downto 0);
     variable e3, e4     : unsigned(6 downto 0);
     variable ta, tb, tg : went_type;
-    variable sg         : unsigned(1 downto 0);
-    variable pg         : unsigned(4 downto 0);
+    variable tal, tbl, tgl : went_array(0 to 2);   -- per register file line
     variable ka         : kinda_type;
     variable kb         : kindb_type;
     variable rn         : unsigned(17 downto 0);
@@ -712,12 +717,16 @@ begin
       end if;
 
       -- Element walk: two table lookups. The line of the start is selected
-      -- separately, so the head move doesn't add to the lookup.
+      -- separately, so the head move doesn't add to the lookup: each lookup
+      -- is one per register file line, then the line select.
       l0 := rel_raw(6 downto 5) + radd - ("0" & rsh);
       s0 := m3(kreg, to_integer(rel_raw(6 downto 5)));
       e0 := l0 & rel_raw(4 downto 0);
       if l0(0) = lag then w0 := 0; else w0 := 1; end if;
-      ta := wf(to_integer(s0)).t(to_integer(rel_raw(4 downto 0)));
+      for l in 0 to 2 loop
+        tal(l) := wf(l).t(to_integer(rel_raw(4 downto 0)));
+      end loop;
+      ta := tal(to_integer(s0));
       ka := kinda_of(ta.kf, w0);
       -- The end marker of a chunk that ends exactly at the end of the first
       -- window line is at the start of the second (whose table may not exist).
@@ -731,7 +740,10 @@ begin
       l1 := e1(6 downto 5);
       l2 := e2(6 downto 5);
       if l2(0) = lag then w2 := 0; else w2 := 1; end if;
-      tb := wf(to_integer(s2)).t(to_integer(ta.s2(4 downto 0)));
+      for l in 0 to 2 loop
+        tbl(l) := wf(l).t(to_integer(ta.s2(4 downto 0)));
+      end loop;
+      tb := tbl(to_integer(s2));
       kb := tb.kb(w2);
       -- Slot 2 start past the window.
       if (lag = '0' and l2(1) = '1') or (lag = '1' and l2 = "11") then
@@ -740,15 +752,11 @@ begin
       e3 := tpos(l2, tb.step);
       e4 := tpos(l2, tb.s2);
       -- The end of the big element of the cycle (at most one: slot 0 if it
-      -- isn't small, otherwise slot 1).
-      if ta.kf.sm = '0' then
-        sg := s0;
-        pg := rel_raw(4 downto 0);
-      else
-        sg := s1;
-        pg := ta.step(4 downto 0);
-      end if;
-      tg := wf(to_integer(sg)).t(to_integer(pg));
+      -- isn't small, otherwise slot 1). Both are at step(e0).
+      for l in 0 to 2 loop
+        tgl(l) := wf(l).t(to_integer(ta.step(4 downto 0)));
+      end loop;
+      tg := tgl(to_integer(s1));
 
       -- Next start, and whether it is past the first window line (ge).
       ra := "00";
@@ -885,12 +893,14 @@ begin
 
   fx_proc: process (clk) is
     variable f    : fline_type;
+    variable win  : byte_array(0 to 9);
     variable b0   : std_logic_vector(7 downto 0);
     variable b1   : std_logic_vector(7 downto 0);
     variable b2   : std_logic_vector(7 downto 0);
     variable pos  : integer range 0 to QB-1;
+    variable p8   : integer range 0 to 3;
+    variable p1   : integer range 0 to 7;
     variable hend : unsigned(5 downto 0);
-    variable base : unsigned(19 downto 0);
     variable li   : unsigned(17 downto 0);
   begin
     if rising_edge(clk) then
@@ -901,10 +911,17 @@ begin
         for i in 0 to QB-1 loop
           f.hl(i) := unsigned(fq(k)(8*(QB+2)+4*i+3 downto 8*(QB+2)+4*i));
         end loop;
+        -- The three bytes at the element start, in two steps: the 8-byte
+        -- group (plus two), then the byte within it.
         pos := to_integer(fz_e(k)(4 downto 0));
-        b0 := f.w(pos);
-        b1 := f.w(pos + 1);
-        b2 := f.w(pos + 2);
+        p8 := to_integer(fz_e(k)(4 downto 3));
+        p1 := to_integer(fz_e(k)(2 downto 0));
+        for i in 0 to 9 loop
+          win(i) := f.w(8 * p8 + i);
+        end loop;
+        b0 := win(p1);
+        b1 := win(p1 + 1);
+        b2 := win(p1 + 2);
         hend := resize(fz_e(k)(4 downto 0), 6) + f.hl(pos);
         -- Small elements are at most 12 bytes, so their literal length
         -- follows modulo 16 from the next start (in any line).
@@ -924,9 +941,11 @@ begin
             el(k).cp <= (others => '0');
             el(k).off <= (others => '0');
         end case;
-        base := (fz_lc + resize(fz_e(k)(6 downto 5), 15)) & "00000";
         el(k).li <= li(16 downto 0);
-        el(k).q <= base + resize(hend, 20);
+        -- Line of the element start, plus the header end (which may be in
+        -- the next line).
+        el(k).q <= (fz_lc + resize(fz_e(k)(6 downto 5), 15) + resize(hend(5 downto 5), 15))
+                 & hend(4 downto 0);
         el(k).last <= '0';
         el(k).tot <= (others => '0');
         el(k).pw2 <= '0';
