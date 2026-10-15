@@ -239,7 +239,12 @@ architecture behavior of vhsnunzip_quad_group is
   attribute shreg_extract : string;
   attribute shreg_extract of p0_el, p0_ps, p0_pe, p2a, p2b, p2, tail, sn, gb : signal is "no";
 
+  -- Internal copy of the gr output, which is read back (VHDL-93 can't read an out port).
+  signal gr_r     : qgroup_type;
+
 begin
+
+  gr <= gr_r;
 
   -----------------------------------------------------------------------------
   -- Pre-pass stage 1: derived flags and absolute positions.
@@ -547,7 +552,7 @@ begin
   begin
     if rising_edge(clk) then
       wpos_r <= lb_wpos(PW-1 downto 0);
-      d := wpos_r(15 downto 0) - gr.lnext;
+      d := wpos_r(15 downto 0) - gr_r.lnext;
       ok := '0';
       if d(15) = '0' and d >= 320 then
         ok := '1';
@@ -1095,11 +1100,11 @@ begin
       if gb.valid = '0' then
         g.rd_v := "0000";
       end if;
-      gr <= g;
+      gr_r <= g;
       if reset = '1' then
-        gr.valid <= '0';
-        gr.rd_v <= "0000";
-        gr.lnext <= (others => '0');
+        gr_r.valid <= '0';
+        gr_r.rd_v <= "0000";
+        gr_r.lnext <= (others => '0');
       end if;
     end if;
   end process;
@@ -1115,7 +1120,7 @@ begin
           & " lsafe=" & std_logic'image(lsafe) & " stall=" & std_logic'image(stall) & " bub=" & std_logic'image(bubble)
           & " fcnt=" & integer'image(to_integer(fcnt)) & " w0.e=" & integer'image(to_integer(w(0).e))
           & " w0.last=" & std_logic'image(w(0).last) & " w0.q=" & integer'image(to_integer(w(0).q))
-          & " wpos=" & integer'image(to_integer(wpos_r)) & " lnext=" & integer'image(to_integer(gr.lnext)) & " gv=" & std_logic'image(gr.valid);
+          & " wpos=" & integer'image(to_integer(wpos_r)) & " lnext=" & integer'image(to_integer(gr_r.lnext)) & " gv=" & std_logic'image(gr_r.valid);
       end if;
     end if;
   end process;

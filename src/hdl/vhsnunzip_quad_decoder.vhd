@@ -562,7 +562,12 @@ architecture behavior of vhsnunzip_quad_decoder is
   type u6_arr4 is array (0 to QK-1) of unsigned(5 downto 0);
   signal fz_en    : u6_arr4;
 
+  -- Internal copy of the el_cnt output, which the debug print reads back.
+  signal el_cnt_r : unsigned(2 downto 0);
+
 begin
+
+  el_cnt <= el_cnt_r;
 
   -----------------------------------------------------------------------------
   -- Input pipeline: FIFO -> x1 -> x2 -> (A) line table -> pt -> (B) walk
@@ -959,9 +964,9 @@ begin
           el(k).last <= '1';
         end if;
       end loop;
-      el_cnt <= fz_cnt;
+      el_cnt_r <= fz_cnt;
       if reset = '1' then
-        el_cnt <= "000";
+        el_cnt_r <= "000";
       end if;
     end if;
   end process;
@@ -977,7 +982,7 @@ begin
           & " rsh=" & std_logic'image(rsh) & " lag=" & std_logic'image(lag)
           & " nc=" & std_logic'image(newchunk) & " qcnt=" & integer'image(to_integer(qcnt)) & " x1v=" & std_logic'image(x1v)
           & " x2v=" & std_logic'image(x2v) & " ptv=" & std_logic'image(ptv) & " pop=" & std_logic'image(pop) & " lc=" & integer'image(to_integer(lc_next))
-          & " el_cnt=" & integer'image(to_integer(el_cnt)) & " sp=" & std_logic'image(el_space)
+          & " el_cnt=" & integer'image(to_integer(el_cnt_r)) & " sp=" & std_logic'image(el_space)
           & " cons=" & integer'image(to_integer(cons_pos));
       end if;
     end if;
