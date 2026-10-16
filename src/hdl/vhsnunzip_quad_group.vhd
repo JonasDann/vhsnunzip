@@ -896,7 +896,10 @@ begin
         if act(0) = '1' then
           hfresh <= '0';
         end if;
-        if dbl0 = '1' then
+        -- Only a head that went out in a group has emitted its period. With
+        -- act(0) = '0' (stall, bubble) the head is evaluated again next cycle
+        -- and must keep its offset.
+        if dbl0 = '1' and act(0) = '1' then
           hoff <= hoff(14 downto 0) & '0';
         end if;
       else
