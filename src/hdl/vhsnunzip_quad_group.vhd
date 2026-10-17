@@ -209,6 +209,7 @@ architecture behavior of vhsnunzip_quad_group is
   signal bubble   : std_logic := '0';
   signal wpos_r   : pos_type := (others => '0');
   signal lsafe    : std_logic := '0';
+  signal lfront   : pos_type := (others => '0');
 
   -- Snapshot for G2b.
   type snap_type is record
@@ -498,8 +499,15 @@ begin
       if fwe(2) = '1' then fmem2(to_integer(fwa(2)(FD_LOG2-1 downto 0))) <= qe_pack(fwd(2)); end if;
       if fwe(3) = '1' then fmem3(to_integer(fwa(3)(FD_LOG2-1 downto 0))) <= qe_pack(fwd(3)); end if;
       wp <= wp + p2_cnt;
+      -- End of the last literal written to the FIFO.
+      for k in 0 to QK-1 loop
+        if k < p2_cnt and p2(k).li /= 0 then
+          lfront <= p2(k).q + resize(p2(k).li, PW);
+        end if;
+      end loop;
       if reset = '1' then
         wp <= (others => '0');
+        lfront <= (others => '0');
       end if;
     end if;
   end process;
@@ -540,14 +548,13 @@ begin
   -----------------------------------------------------------------------------
   -- Literal availability: a group reads literal bytes within 64 bytes of the
   -- current literal position, which is at most two groups ahead of the last
-  -- issued group's lnext. Otherwise wait until every literal in the window is
-  -- in the buffer.
+  -- issued group's lnext. Otherwise wait until every literal in the FIFO is
+  -- in the buffer. Checking only the window isn't enough: lsafe is used a
+  -- cycle later, when elements that just left the FIFO can be in the window.
   -----------------------------------------------------------------------------
   lsafe_proc: process (clk) is
     variable d    : unsigned(15 downto 0);
     variable d20  : pos_type;
-    variable lend : pos_type;
-    variable lq, le, lc : pos_type;
     variable ok   : std_logic;
   begin
     if rising_edge(clk) then
@@ -557,20 +564,10 @@ begin
       if d(15) = '0' and d >= 320 then
         ok := '1';
       end if;
-      -- Escape: the literal of the last element in the window (and so
-      -- every literal before it) is completely in the buffer.
-      lq := (others => '0');
-      le := (others => '0');
-      lc := (others => '0');
-      for k in 0 to QK-1 loop
-        if wv(k) = '1' then
-          lq := w(k).q;
-          le := w(k).e;
-          lc := w(k).ecp;
-        end if;
-      end loop;
-      lend := lq + le - lc;
-      d20 := wpos_r - lend;
+      -- Escape: the last literal written to the FIFO (and so every literal
+      -- of an element that can be in the window next cycle) is completely
+      -- in the buffer.
+      d20 := wpos_r - lfront;
       if wv(0) = '1' and d20(PW-1) = '0' then
         ok := '1';
       end if;
